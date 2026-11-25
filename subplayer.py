@@ -25,7 +25,7 @@ else:
 # SOURCES AND CONFIGURATION FOR SUBPLAYER
 # ==============================================================================
 PROJECT_NAME = "subplayer"
-VERSION = "2.5"
+VERSION = "2.6"
 CACHE_DIR_NAME = ".cache"
 SUBS_DIR_NAME = "subs"
 AUDIO_DIR_NAME = "audio"
@@ -67,7 +67,8 @@ PROMPT_TIMEOUT_SEC = 15
 MAX_CONSECUTIVE_MUSIC_BLOCKS = 2
 DOWNLOAD_CHUNK = 1 << 20  # 1 MiB
 SEP_LINE = "=" * 74
-MUSIC_GLYPH = "♪ ♪"
+MUSIC_TAG = "[MUSIC]"
+NOISE_TAG = "[NOISE]"
 
 QUICK_LANGUAGES: list[tuple[str, str]] = [
     ("en", "English (base EN subtitles)"),
@@ -235,6 +236,9 @@ DURATION_LINE_RE = re.compile(
 # Matches bracketed or parenthesized non-speech tags like [MUSIC], (dramatic music), [GUNSHOTS], etc.
 BRACKET_TAG_RE = re.compile(r"\[[^\[\]]*\]|\([^\(\)]*\)")
 MUSIC_NOTES_ONLY_RE = re.compile(r"^[\s♪♫♩♬#*~-]+$")
+NOISE_SYMBOL_ONLY_RE = re.compile(r"^[\s🔊🔉🔈📢💥⚡•…-]+$")
+INLINE_MUSIC_GLYPH_RE = re.compile(r"[♪♫♩♬]+")
+INLINE_NOISE_GLYPH_RE = re.compile(r"[🔊🔉🔈📢💥⚡]+")
 MUSIC_KEYWORDS = (
     "music",
     "blank audio",
@@ -1129,7 +1133,7 @@ def main():
                 tr_lines.append("")
                 continue
 
-            if "♪" in stripped and not any(ch.isalpha() for ch in stripped):
+            if not any(ch.isalpha() for ch in stripped):
                 tr_lines.append(stripped)
                 translated_ok += 1
                 done_lines += 1
@@ -1736,9 +1740,9 @@ def find_in_system_path(filename: str) -> Path | None:
 def resolve_tool_path(cache_dir: Path, work_dir: Path, filename: str) -> Path:
     """
     Order for ffmpeg/mplayer:
-      1. .cache
-      2. system PATH
-      3. work_dir / fallback .cache path
+1. .cache
+2. system PATH
+3. work_dir / fallback .cache path
     For whisper (and others): .cache -> work_dir (never PATH).
     """
     cached_path = cache_dir / filename
@@ -2376,33 +2380,43 @@ def _is_music_tag_content(inner_text: str) -> bool:
 def _clean_subtitle_text(raw_text: str) -> tuple[str | None, bool]:
     """
     Normalize a subtitle block text:
-      - Music / singing / blank audio markers -> '♪ ♪' (returns ('♪ ♪', True))
-      - Non-speech sound effects in [...] or (...) -> stripped completely
-      - If no spoken text remains -> returns (None, False) so the block is dropped
+- Standalone music / singing / blank audio markers -> '[MUSIC]' (returns ('[MUSIC]', True))
+- Standalone other non-speech sound effects in [...] or (...) or noise icons -> '[NOISE]' (returns ('[NOISE]', True))
+- Any [...] / (...) or music/noise icons inside spoken sentences -> removed cleanly (returns (spoken_text, False))
     """
     txt = " ".join(raw_text.split()).strip()
     if not txt:
         return None, False
 
     if MUSIC_NOTES_ONLY_RE.match(txt):
-        return MUSIC_GLYPH, True
+        return MUSIC_TAG, True
+
+    if NOISE_SYMBOL_ONLY_RE.match(txt):
+        return NOISE_TAG, True
 
     bracket_tags = BRACKET_TAG_RE.findall(txt)
     has_music_tag = any(_is_music_tag_content(tag[1:-1]) for tag in bracket_tags)
+    has_other_sfx = any(not _is_music_tag_content(tag[1:-1]) for tag in bracket_tags)
 
-    # Remove all [...] and (...) non-speech annotations
+    # Strip all [...] and (...) annotations and inline music/noise glyphs from spoken text
     spoken = BRACKET_TAG_RE.sub(" ", txt)
-    # Remove stray musical symbols if mixed with tags
-    spoken = spoken.replace("♪", " ").replace("♫", " ")
+    spoken = INLINE_MUSIC_GLYPH_RE.sub(" ", spoken)
+    spoken = INLINE_NOISE_GLYPH_RE.sub(" ", spoken)
     spoken = " ".join(spoken.split()).strip()
-    # Clean dangling leading/trailing punctuation left after stripping a tag (e.g. "- [snaps] Hey" -> "- Hey")
-    spoken = re.sub(r"^[-–—,:;.\s]+$", "", spoken).strip()
+    # If only dangling punctuation remains after removing tags/icons, treat as empty spoken text
+    if re.fullmatch(r"[-–—,:;.\s]+", spoken):
+        spoken = ""
 
     if spoken:
+        # Clean up extra spaces before punctuation after mid-sentence tag/icon removal
+        spoken = re.sub(r"\s+([,.;:!?])", r"\1", spoken)
         return spoken, False
 
     if has_music_tag:
-        return MUSIC_GLYPH, True
+        return MUSIC_TAG, True
+
+    if has_other_sfx or bracket_tags:
+        return NOISE_TAG, True
 
     return None, False
 
@@ -2413,23 +2427,23 @@ def _clean_srt_blocks_and_rewrite(srt_path: Path) -> int:
 
     raw = srt_path.read_text(encoding="utf-8", errors="replace")
     cleaned_entries: list[str] = []
-    consecutive_music = 0
+    consecutive_non_speech = 0
     idx = 1
 
     for blk in BLOCK_SPLIT_RE.split(raw.strip()):
         lines = [ln.rstrip("\r") for ln in blk.splitlines() if ln.strip()]
         if len(lines) < 3 or "-->" not in lines[1]:
             continue
-        cleaned_txt, is_music = _clean_subtitle_text(" ".join(lines[2:]))
+        cleaned_txt, is_non_speech = _clean_subtitle_text(" ".join(lines[2:]))
         if not cleaned_txt:
             continue
 
-        if is_music:
-            consecutive_music += 1
-            if consecutive_music > MAX_CONSECUTIVE_MUSIC_BLOCKS:
+        if is_non_speech:
+            consecutive_non_speech += 1
+            if consecutive_non_speech > MAX_CONSECUTIVE_MUSIC_BLOCKS:
                 continue
         else:
-            consecutive_music = 0
+            consecutive_non_speech = 0
 
         cleaned_entries.append(f"{idx}\n{lines[1].strip()}\n{cleaned_txt}\n")
         idx += 1
@@ -2445,7 +2459,7 @@ def _clean_srt_blocks_and_rewrite(srt_path: Path) -> int:
 
 def build_srt_from_stdout_lines(lines: list[str], srt_path: Path) -> int:
     segments: list[tuple[float, float, str]] = []
-    consecutive_music = 0
+    consecutive_non_speech = 0
     for raw_line in lines:
         m = TIMESTAMP_LINE_RE.search(raw_line)
         if not m:
@@ -2454,15 +2468,15 @@ def build_srt_from_stdout_lines(lines: list[str], srt_path: Path) -> int:
         e_sec = parse_whisper_ts_to_sec(m.group(2))
         if e_sec <= s_sec:
             continue
-        cleaned_txt, is_music = _clean_subtitle_text(m.group(3))
+        cleaned_txt, is_non_speech = _clean_subtitle_text(m.group(3))
         if not cleaned_txt:
             continue
-        if is_music:
-            consecutive_music += 1
-            if consecutive_music > MAX_CONSECUTIVE_MUSIC_BLOCKS:
+        if is_non_speech:
+            consecutive_non_speech += 1
+            if consecutive_non_speech > MAX_CONSECUTIVE_MUSIC_BLOCKS:
                 continue
         else:
-            consecutive_music = 0
+            consecutive_non_speech = 0
         segments.append((s_sec, e_sec, cleaned_txt))
 
     if not segments:
