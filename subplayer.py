@@ -1,12 +1,12 @@
 import argparse
-import ctypes
-import importlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -34,18 +34,23 @@ WHISPER_MODE_MARKER = ".whisper_mode"
 FFMPEG_GITHUB_RELEASES_API = "https://api.github.com/repos/FFmpeg-Builds/FFmpeg-Builds/releases"
 WHISPER_GITHUB_RELEASES_API = "https://api.github.com/repos/ggml-org/whisper.cpp/releases"
 
+_HF = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
 WHISPER_MODEL_URLS: dict[str, str] = {
-    "ggml-tiny.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
-    "ggml-tiny.en.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
-    "ggml-base.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
-    "ggml-base.en.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-    "ggml-small.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
-    "ggml-small.en.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
-    "ggml-medium.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
-    "ggml-medium.en.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
-    "ggml-large-v3.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
-    "ggml-large-v3-turbo.bin": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+    name: _HF + name
+    for name in (
+        "ggml-tiny.bin",
+        "ggml-tiny.en.bin",
+        "ggml-base.bin",
+        "ggml-base.en.bin",
+        "ggml-small.bin",
+        "ggml-small.en.bin",
+        "ggml-medium.bin",
+        "ggml-medium.en.bin",
+        "ggml-large-v3.bin",
+        "ggml-large-v3-turbo.bin",
+    )
 }
+_WHISPER_MODEL_URLS_LOWER = {k.lower(): v for k, v in WHISPER_MODEL_URLS.items()}
 
 FALLBACK_URLS = {
     "model_base": WHISPER_MODEL_URLS["ggml-base.bin"],
@@ -59,6 +64,7 @@ DEFAULT_MODEL = "ggml-small.bin"
 DEFAULT_SUB_SCALE = 2.2
 PROMPT_TIMEOUT_SEC = 15
 MAX_CONSECUTIVE_MUSIC_BLOCKS = 2
+DOWNLOAD_CHUNK = 1 << 20  # 1 MiB
 
 QUICK_LANGUAGES: list[tuple[str, str]] = [
     ("en", "English (base EN subtitles)"),
@@ -180,101 +186,62 @@ SUPPORTED_LANGUAGES: dict[str, str] = {
 }
 
 # ==============================================================================
-# ANSI COLOR HELPERS (MUTED YELLOW FOR ACTIVE ACTIONS, SOFT WHITE/GRAY FOR REST)
+# PRECOMPILED REGEXES
 # ==============================================================================
-ESC = chr(27)
-RESET = f"{ESC}[0m"
-SOFT_WHITE = f"{ESC}[37m"
-MUTED_GRAY = f"{ESC}[90m"
-SOFT_YELLOW = f"{ESC}[33m"
-SOFT_GREEN = f"{ESC}[32m"
-SOFT_RED = f"{ESC}[31m"
-SOFT_CYAN = f"{ESC}[36m"
-ANSI_STRIP_RE = re.compile(re.escape(ESC) + r"\[[0-9;]*m")
+LANG_CLEAN_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+NON_ALPHA_RE = re.compile(r"[^a-zA-Z]+")
+BLOCK_SPLIT_RE = re.compile(r"\r?\n\r?\n")
+TIMESTAMP_LINE_RE = re.compile(
+    r"\[(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})\]\s*(.*)"
+)
+MUSIC_TAGS = frozenset(("music", "music playing", "blank audio", "applause"))
 
-_COLOR_ENABLED = False
-
-
+# ==============================================================================
+# CLEAN CONSOLE OUTPUT HELPERS (NO BROKEN ESCAPE SEQUENCES ON WINDOWS)
+# ==============================================================================
 def enable_windows_ansi() -> None:
-    """Enable virtual terminal ANSI sequences on Windows consoles."""
-    global _COLOR_ENABLED
+    """Keep console output clean without raw/corrupted ANSI escape artifacts."""
     if os.name == "nt":
         try:
-            kernel32 = ctypes.windll.kernel32
-            h_out = kernel32.GetStdHandle(-11)
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(h_out, mode.value | 0x0004)
+            os.system("")
         except Exception:
             pass
-    _COLOR_ENABLED = sys.stdout.isatty() or os.name == "nt"
 
 
-def bracket_tag(tag_text: str, inner_color: str = "") -> str:
-    """Format a status tag with soft-white brackets and muted inner color."""
-    if not _COLOR_ENABLED:
-        return f"[{tag_text}]"
-    if inner_color:
-        return f"{SOFT_WHITE}[{RESET}{inner_color}{tag_text}{RESET}{SOFT_WHITE}]{RESET}"
-    return f"{SOFT_WHITE}[{RESET}{SOFT_WHITE}{tag_text}{RESET}{SOFT_WHITE}]{RESET}"
+def bracket_tag(tag_text: str, inner_color: str = "", body_color: str = "") -> str:
+    return f"[{tag_text}]"
 
 
-def ok_tag() -> str:
-    return bracket_tag("OK", SOFT_GREEN)
+def ok_tag(body_color: str = "") -> str:
+    return "[OK]"
 
 
-def warn_tag(label: str = "WARN") -> str:
-    return bracket_tag(label, SOFT_YELLOW)
+def warn_tag(label: str = "WARN", body_color: str = "") -> str:
+    return f"[{label}]"
 
 
-def err_tag(label: str = "ERROR") -> str:
-    return bracket_tag(label, SOFT_RED)
+def err_tag(label: str = "ERROR", body_color: str = "") -> str:
+    return f"[{label}]"
+
+
+def info_tag(label: str = "INFO", body_color: str = "") -> str:
+    return f"[{label}]"
 
 
 def colorize_message(msg: str, important: bool = False) -> str:
-    """Colorize bracketed tags; important messages use soft yellow, others muted gray/white."""
-    if not _COLOR_ENABLED:
-        return msg
-
-    def repl(match: re.Match) -> str:
-        inner = match.group(1)
-        upper = inner.strip().upper()
-        if upper == "OK":
-            color = SOFT_GREEN
-        elif upper in ("WARN", "WARNING"):
-            color = SOFT_YELLOW
-        elif upper in ("ERROR", "ERR", "STOP"):
-            color = SOFT_RED
-        elif upper in ("INFO", "FETCH", "MISSING"):
-            color = SOFT_YELLOW if important else SOFT_CYAN
-        else:
-            color = SOFT_YELLOW if important else SOFT_WHITE
-        return bracket_tag(inner, color)
-
-    colored = re.sub(r"\[([^\[\]\r\n]+)\]", repl, msg)
-    text_color = SOFT_YELLOW if important else MUTED_GRAY
-    return f"{text_color}{colored}{RESET}"
+    return msg
 
 
 def cprint(msg: str = "", end: str = "\n", flush: bool = True, important: bool = False) -> None:
-    """Print a message: important actions in soft yellow, secondary lines in muted gray."""
-    print(colorize_message(msg, important=important), end=end, flush=flush)
+    print(msg, end=end, flush=flush)
 
 
 def cprint_step(msg: str) -> None:
-    """Print an active step / action message in soft yellow."""
-    cprint(msg, important=True)
+    print(msg, flush=True)
 
 
-def _supports_unicode_bar() -> bool:
-    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
-    if "utf" in enc:
-        return True
-    try:
-        "\u2501".encode(enc or "ascii")
-        return True
-    except Exception:
-        return False
+def cprint_dim(msg: str = "", end: str = "\n", flush: bool = True) -> None:
+    print(msg, end=end, flush=flush)
 
 
 def render_bar_segment(
@@ -283,19 +250,11 @@ def render_bar_segment(
     bar_width: int = 32,
     done: bool = False,
 ) -> str:
-    """Render a determinate or indeterminate progress bar segment."""
-    use_unicode = _supports_unicode_bar()
-    fill_char = "\u2501" if use_unicode else "#"
-    empty_char = "\u2501" if use_unicode else "-"
-
     if ratio is not None:
         clamped = min(1.0, max(0.0, ratio))
         filled = int(round(bar_width * clamped))
         empty = bar_width - filled
-        if _COLOR_ENABLED:
-            bar_color = SOFT_GREEN if done else SOFT_YELLOW
-            return f"{bar_color}{fill_char * filled}{RESET}{MUTED_GRAY}{empty_char * empty}{RESET}"
-        return f"[{fill_char * filled}{empty_char * empty}]"
+        return f"[{'#' * filled}{'-' * empty}]"
 
     pos = int(elapsed_sec * 10) % bar_width
     seg_len = 6
@@ -304,16 +263,12 @@ def render_bar_segment(
         in_seg = (pos <= i < pos + seg_len) or (
             pos + seg_len > bar_width and i < (pos + seg_len) % bar_width
         )
-        if in_seg:
-            chars.append(f"{SOFT_YELLOW}{fill_char}{RESET}" if _COLOR_ENABLED else fill_char)
-        else:
-            chars.append(f"{MUTED_GRAY}{empty_char}{RESET}" if _COLOR_ENABLED else empty_char)
-    return "".join(chars) if _COLOR_ENABLED else f"[{''.join(chars)}]"
+        chars.append("=" if in_seg else "-")
+    return f"[{''.join(chars)}]"
 
 
 def write_live_line(line: str, state: dict, newline: bool = False) -> None:
-    """Overwrite the current console line cleanly without leftover characters."""
-    plain_len = len(ANSI_STRIP_RE.sub("", line))
+    plain_len = len(line)
     last_len = state.get("last_len", 0)
     pad = " " * max(0, last_len - plain_len)
     state["last_len"] = plain_len
@@ -323,7 +278,6 @@ def write_live_line(line: str, state: dict, newline: bool = False) -> None:
 
 
 def finish_live_line_if_needed(state: dict) -> None:
-    """Terminate a live progress line if one is currently active."""
     if state.get("last_len", 0) > 0:
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -338,7 +292,6 @@ def format_pip_progress_bar(
     bar_width: int = 32,
     done: bool = False,
 ) -> str:
-    """Format a download progress line with speed and size."""
     speed_bps = downloaded / max(elapsed_sec, 0.001)
     if speed_bps >= 1024 * 1024:
         speed_str = f"{speed_bps / (1024 * 1024):.1f} MB/s"
@@ -346,21 +299,18 @@ def format_pip_progress_bar(
         speed_str = f"{speed_bps / 1024:.0f} KB/s"
 
     dl_mb = downloaded / (1024 * 1024)
-    meta_color = SOFT_YELLOW if _COLOR_ENABLED else ""
-    rst = RESET if _COLOR_ENABLED else ""
-
     if total_bytes and total_bytes > 0:
         ratio = min(1.0, max(0.0, downloaded / total_bytes))
         pct = ratio * 100.0
         tot_mb = total_bytes / (1024 * 1024)
         bar_str = render_bar_segment(ratio, elapsed_sec, bar_width=bar_width, done=done)
         return (
-            f"      {bar_str} {meta_color}{dl_mb:.1f}/{tot_mb:.1f} MB ({pct:3.0f}%) "
-            f"{speed_str} - {label}{rst}"
+            f"      {bar_str} {dl_mb:.1f}/{tot_mb:.1f} MB ({pct:3.0f}%) "
+            f"{speed_str} - {label}"
         )
 
     bar_str = render_bar_segment(None, elapsed_sec, bar_width=bar_width, done=done)
-    return f"      {bar_str} {meta_color}{dl_mb:.1f} MB {speed_str} - {label}{rst}"
+    return f"      {bar_str} {dl_mb:.1f} MB {speed_str} - {label}"
 
 
 def format_time_progress_bar(
@@ -372,25 +322,19 @@ def format_time_progress_bar(
     bar_width: int = 32,
     done: bool = False,
 ) -> str:
-    """Format a time-based progress bar line with active label in soft yellow."""
     extra_part = f" | {extra}" if extra else ""
-    active_color = SOFT_YELLOW if _COLOR_ENABLED else ""
-    dim_color = MUTED_GRAY if _COLOR_ENABLED else ""
-    rst = RESET if _COLOR_ENABLED else ""
-
     if total_sec and total_sec > 0:
         ratio = min(1.0, max(0.0, cur_sec / total_sec))
         pct = ratio * 100.0
         bar_str = render_bar_segment(ratio, elapsed_sec, bar_width=bar_width, done=done)
         return (
-            f"  {bar_str} {dim_color}{cur_sec:6.1f}/{total_sec:6.1f}s ({pct:3.0f}%) "
-            f"| {elapsed_sec:5.1f}s{extra_part} - {rst}{active_color}{label}{rst}"
+            f"  {bar_str} {cur_sec:6.1f}/{total_sec:6.1f}s ({pct:3.0f}%) "
+            f"| {elapsed_sec:5.1f}s{extra_part} - {label}"
         )
 
     bar_str = render_bar_segment(None, elapsed_sec, bar_width=bar_width, done=done)
     return (
-        f"  {bar_str} {dim_color}{cur_sec:6.1f}s | {elapsed_sec:5.1f}s{extra_part} - "
-        f"{rst}{active_color}{label}{rst}"
+        f"  {bar_str} {cur_sec:6.1f}s | {elapsed_sec:5.1f}s{extra_part} - {label}"
     )
 
 
@@ -398,227 +342,474 @@ def format_time_progress_bar(
 # SUBTITLE NAMING & SELECTION HELPERS
 # ==============================================================================
 def normalize_lang_code(lang: str | None) -> str:
-    """Normalize a language code into a safe filename tag."""
-    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "", (lang or "").strip().lower())
+    cleaned = LANG_CLEAN_RE.sub("", (lang or "").strip().lower())
     return cleaned or "en"
 
 
 def build_srt_path(subs_dir: Path, media_stem: str, lang_code: str) -> Path:
-    """Build `<media_stem>_<lang>.srt` inside `<subs_dir>`."""
     return subs_dir / f"{media_stem}_{normalize_lang_code(lang_code)}.srt"
 
 
-def find_existing_srts_for_media(subs_dir: Path, media_stem: str) -> list[Path]:
-    """Find non-empty subtitle files matching `<media_stem>_<lang>.srt` or `<media_stem>.srt`."""
-    if not subs_dir.is_dir():
+def move_srt_to_media_dir(cached_srt_path: Path, media_dir: Path) -> Path:
+    if not _file_nonempty(cached_srt_path):
+        return cached_srt_path
+
+    dest_path = media_dir / cached_srt_path.name
+    try:
+        if os.path.abspath(str(cached_srt_path)) == os.path.abspath(str(dest_path)):
+            return cached_srt_path
+    except OSError:
+        pass
+
+    try:
+        dest_path.unlink(missing_ok=True)
+        shutil.move(str(cached_srt_path), str(dest_path))
+        if _file_nonempty(dest_path):
+            cprint_step(f"  {ok_tag()} Moved subtitles to media directory: {dest_path}")
+            return dest_path
+    except Exception as e:
+        cprint(
+            f"  {info_tag()} Could not move subtitles to {media_dir} ({e}) "
+            f"-> keeping in cache: {cached_srt_path}"
+        )
+
+    return cached_srt_path
+
+
+def _scan_srt_dir(directory: Path, media_stem: str) -> list[Path]:
+    if not directory.is_dir():
         return []
 
     found: list[Path] = []
-    prefix = f"{media_stem}_"
-    for entry in subs_dir.iterdir():
-        if not entry.is_file() or entry.suffix.lower() != ".srt":
-            continue
-        try:
-            if entry.stat().st_size <= 0:
-                continue
-        except OSError:
-            continue
+    stem_lower = media_stem.lower()
+    prefix_under = f"{stem_lower}_"
+    prefix_dot = f"{stem_lower}."
 
-        stem = entry.stem
-        if stem == media_stem or (stem.startswith(prefix) and len(stem) > len(prefix)):
-            found.append(entry)
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                name = entry.name
+                if not name.lower().endswith(".srt"):
+                    continue
+                cand_stem = name[:-4]
+                cand_lower = cand_stem.lower()
+                matches = (
+                    cand_lower == stem_lower
+                    or (cand_lower.startswith(prefix_under) and len(cand_lower) > len(prefix_under))
+                    or (cand_lower.startswith(prefix_dot) and len(cand_lower) > len(prefix_dot))
+                )
+                if not matches:
+                    continue
+                try:
+                    if not entry.is_file() or entry.stat().st_size <= 0:
+                        continue
+                except OSError:
+                    continue
+                found.append(Path(entry.path))
+    except OSError:
+        return []
 
-    en_name = f"{media_stem}_en.srt".lower()
-    found.sort(key=lambda p: (0 if p.name.lower() == en_name else 1, p.name.lower()))
     return found
 
 
-def extract_lang_label_from_srt(srt_path: Path, media_stem: str) -> str:
-    """Return a human-readable language label extracted from a subtitle filename."""
-    prefix = f"{media_stem}_"
-    stem = srt_path.stem
-    if stem.startswith(prefix) and len(stem) > len(prefix):
-        code = stem[len(prefix) :].lower()
+def find_existing_srts_for_media(
+    subs_dir: Path, media_stem: str, media_dir: Path | None = None
+) -> list[Path]:
+    seen: set[str] = set()
+    ordered: list[Path] = []
+
+    def add_items(items: list[Path]) -> None:
+        for p in items:
+            key = os.path.normcase(os.path.abspath(str(p)))
+            if key not in seen:
+                seen.add(key)
+                ordered.append(p)
+
+    local_srts: list[Path] = []
+    if media_dir is not None:
+        local_srts = _scan_srt_dir(media_dir, media_stem)
+        local_srts.sort(key=lambda p: (0 if p.stem.lower() == media_stem.lower() else 1, p.name.lower()))
+        add_items(local_srts)
+
+    cache_srts = _scan_srt_dir(subs_dir, media_stem)
+    en_name = f"{media_stem}_en.srt".lower()
+    cache_srts.sort(key=lambda p: (0 if p.name.lower() == en_name else 1, p.name.lower()))
+    add_items(cache_srts)
+
+    return ordered
+
+
+def extract_lang_code_from_srt(srt_path: Path, media_stem: str) -> str | None:
+    stem_lower = srt_path.stem.lower()
+    base_lower = media_stem.lower()
+    for sep in ("_", "."):
+        prefix = f"{base_lower}{sep}"
+        if stem_lower.startswith(prefix) and len(stem_lower) > len(prefix):
+            code = stem_lower[len(prefix) :]
+            if code in SUPPORTED_LANGUAGES:
+                return code
+    return None
+
+
+def extract_lang_label_from_srt(srt_path: Path, media_stem: str, subs_dir: Path | None = None) -> str:
+    src_tag = "cache"
+    if subs_dir is not None:
+        try:
+            in_cache = os.path.commonpath(
+                [os.path.abspath(str(srt_path.parent)), os.path.abspath(str(subs_dir))]
+            ) == os.path.abspath(str(subs_dir))
+            if not in_cache:
+                src_tag = "local file"
+        except ValueError:
+            src_tag = "local file"
+
+    code = extract_lang_code_from_srt(srt_path, media_stem)
+    if code:
         full_name = SUPPORTED_LANGUAGES.get(code)
-        return f"{code} ({full_name})" if full_name else code
-    return "unlabeled"
+        lang_part = f"{code} ({full_name})" if full_name else code
+    elif srt_path.stem.lower() == media_stem.lower():
+        lang_part = "same-name SRT"
+    else:
+        lang_part = "unlabeled"
+
+    return f"{lang_part}, {src_tag}"
+
+
+def _file_nonempty(p: Path) -> bool:
+    try:
+        return p.stat().st_size > 0
+    except OSError:
+        return False
 
 
 # ==============================================================================
-# OFFLINE TRANSLATION (PIP INSTALL INTO .cache/argos_pkg + MODELS IN .cache/argos_models)
+# OFFLINE TRANSLATION (RUN IN EXTERNAL PYTHON SUBPROCESS TO AVOID FROZEN STDLIB ISSUES)
 # ==============================================================================
 def set_argos_env_before_import(models_dir: Path) -> None:
-    """Set Argos Translate directory environment variables before importing `argostranslate`."""
     models_dir.mkdir(parents=True, exist_ok=True)
     os.environ["ARGOS_PACKAGE_DIR"] = str(models_dir)
     os.environ["ARGOS_TRANSLATE_PACKAGE_DIR"] = str(models_dir)
 
 
-def ensure_argostranslate_installed(pkg_dir: Path, models_dir: Path) -> bool:
-    """Ensure `argostranslate` is available in `<pkg_dir>`."""
-    set_argos_env_before_import(models_dir)
-    pkg_dir.mkdir(parents=True, exist_ok=True)
-    pkg_str = str(pkg_dir)
-    if pkg_str not in sys.path:
-        sys.path.insert(0, pkg_str)
+def _is_frozen_executable() -> bool:
+    return bool(getattr(sys, "frozen", False))
 
+
+def _find_external_python_executables() -> list[list[str]]:
+    """Return candidate external Python invocations (e.g., `py -3` or `python.exe`), never self."""
+    candidates: list[list[str]] = []
+    self_exe = ""
     try:
-        import argostranslate  # noqa: F401
-        cprint(f"  {ok_tag()} Package 'argostranslate' is ready (cache pkg dir: {pkg_dir}).")
-        return True
-    except ImportError:
-        pass
+        self_exe = os.path.normcase(os.path.abspath(sys.executable))
+    except OSError:
+        self_exe = ""
 
-    cprint_step(
-        f"  {bracket_tag('FETCH', SOFT_YELLOW)} Installing 'argostranslate' into {pkg_dir} via pip..."
-    )
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--upgrade",
-        "--target",
-        pkg_str,
-        "argostranslate",
-    ]
-    recent_lines: list[str] = []
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    def _is_self(exe_path: str | None) -> bool:
+        if not exe_path or not self_exe:
+            return False
+        try:
+            return os.path.normcase(os.path.abspath(exe_path)) == self_exe
+        except OSError:
+            return False
 
-    try:
-        if proc.stdout:
-            for raw_line in proc.stdout:
-                line = raw_line.rstrip("\r\n")
-                if line.strip():
-                    recent_lines.append(line.strip())
-                    if len(recent_lines) > 10:
-                        recent_lines.pop(0)
-                    cprint(f"    [pip] {line.strip()}")
-        rc = proc.wait()
-    except KeyboardInterrupt:
-        if proc.poll() is None:
-            proc.terminate()
-        cprint(f"\n  {warn_tag()} Installation of 'argostranslate' was interrupted.")
-        raise
+    if not _is_frozen_executable() and sys.executable and not _is_self(sys.executable):
+        candidates.append([sys.executable])
 
-    if rc != 0:
-        tail = " | ".join(recent_lines[-4:]) if recent_lines else "no output captured"
-        cprint(f"  {err_tag()} Cannot install 'argostranslate' (pip exit code {rc}): {tail}")
-        return False
+    if os.name == "nt":
+        py_launcher = shutil.which("py")
+        if py_launcher and not _is_self(py_launcher):
+            candidates.append([py_launcher, "-3"])
+            candidates.append([py_launcher])
 
+        for py_name in ("python.exe", "python3.exe"):
+            found = shutil.which(py_name)
+            if found and not _is_self(found) and [found] not in candidates:
+                candidates.append([found])
+
+        search_roots: list[Path] = []
+        local_app = os.environ.get("LOCALAPPDATA")
+        prog_files = os.environ.get("ProgramFiles")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)")
+        if local_app:
+            search_roots.append(Path(local_app) / "Programs" / "Python")
+        if prog_files:
+            search_roots.append(Path(prog_files))
+        if prog_files_x86:
+            search_roots.append(Path(prog_files_x86))
+
+        for root in search_roots:
+            if not root.is_dir():
+                continue
+            try:
+                for entry in sorted(root.iterdir(), reverse=True):
+                    cand_py = entry / "python.exe"
+                    if cand_py.is_file() and not _is_self(str(cand_py)):
+                        cmd = [str(cand_py)]
+                        if cmd not in candidates:
+                            candidates.append(cmd)
+            except OSError:
+                continue
+    else:
+        for py_name in ("python3", "python"):
+            found = shutil.which(py_name)
+            if found and not _is_self(found) and [found] not in candidates:
+                candidates.append([found])
+
+    return candidates
+
+
+def _find_external_pip_commands() -> list[list[str]]:
+    cmds: list[list[str]] = [py + ["-m", "pip"] for py in _find_external_python_executables()]
+    pip_exe = shutil.which("pip.exe" if os.name == "nt" else "pip3") or shutil.which("pip")
+    if pip_exe and [pip_exe] not in cmds:
+        cmds.append([pip_exe])
+    return cmds
+
+
+_WORKER_SCRIPT = r"""
+import importlib
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+BLOCK_SPLIT_RE = re.compile(r"\r?\n\r?\n")
+
+def main():
+    if len(sys.argv) < 6:
+        print("ERR: missing arguments", file=sys.stderr)
+        sys.exit(2)
+
+    en_srt_path = Path(sys.argv[1])
+    out_srt_path = Path(sys.argv[2])
+    target_lang = sys.argv[3]
+    models_dir = Path(sys.argv[4])
+    pkg_dir = Path(sys.argv[5])
+
+    models_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["ARGOS_PACKAGE_DIR"] = str(models_dir)
+    os.environ["ARGOS_TRANSLATE_PACKAGE_DIR"] = str(models_dir)
+
+    pkg_str = os.path.abspath(str(pkg_dir))
+    if pkg_str in sys.path:
+        sys.path.remove(pkg_str)
+    sys.path.append(pkg_str)
     importlib.invalidate_caches()
-    try:
-        import argostranslate  # noqa: F401
-        cprint_step(f"  {ok_tag()} Package 'argostranslate' installed into {pkg_dir}.")
-        return True
-    except ImportError as e:
-        cprint(
-            f"  {err_tag()} 'argostranslate' installed into {pkg_dir}, but import failed: {e}"
-        )
+
+    import argostranslate.package as argos_pkg
+    import argostranslate.translate as argos_tr
+    import argostranslate.settings as argos_settings
+
+    argos_settings.package_data_dir = models_dir
+    argos_settings.package_dirs = [models_dir]
+    if hasattr(argos_settings, "packages_dir"):
+        argos_settings.packages_dir = models_dir
+
+    def has_route():
+        langs = argos_tr.get_installed_languages()
+        en_l = next((l for l in langs if getattr(l, "code", None) == "en"), None)
+        if not en_l:
+            return False
+        for tr in getattr(en_l, "translations_from", []) or []:
+            to_l = getattr(tr, "to_lang", None)
+            if getattr(to_l, "code", None) == target_lang:
+                return True
         return False
 
-
-def _sync_argos_settings_dirs(models_dir: Path) -> None:
-    """Ensure `argostranslate.settings` points exclusively to `<models_dir>`."""
-    set_argos_env_before_import(models_dir)
-    try:
-        import argostranslate.settings as argos_settings
-
-        argos_settings.package_data_dir = models_dir
-        argos_settings.package_dirs = [models_dir]
-        if hasattr(argos_settings, "packages_dir"):
-            argos_settings.packages_dir = models_dir
-    except Exception:
-        pass
-
-
-def _has_en_to_target_route(argos_tr, target_code: str) -> bool:
-    """Check whether Argos Translate exposes an `en -> <target_code>` translation route."""
-    try:
-        installed_langs = argos_tr.get_installed_languages()
-    except Exception:
-        return False
-
-    en_lang = next((lang for lang in installed_langs if getattr(lang, "code", None) == "en"), None)
-    if en_lang is None:
-        return False
-
-    for tr in getattr(en_lang, "translations_from", []) or []:
-        to_lang = getattr(tr, "to_lang", None)
-        if getattr(to_lang, "code", None) == target_code:
-            return True
-    return False
-
-
-def ensure_argos_en_to_target_module(models_dir: Path, pkg_dir: Path, target_lang: str):
-    """Ensure `argostranslate` and offline model `en -> <target_lang>` are ready."""
-    if not ensure_argostranslate_installed(pkg_dir, models_dir):
-        cprint(f"  {warn_tag()} Skipping offline translation because 'argostranslate' is unavailable.")
-        return None
-
-    target = normalize_lang_code(target_lang)
-    _sync_argos_settings_dirs(models_dir)
-
-    try:
-        import argostranslate.package as argos_pkg
-        import argostranslate.translate as argos_tr
-    except Exception as e:
-        cprint(f"  {err_tag()} Failed to load Argos Translate modules: {e}")
-        return None
-
-    if _has_en_to_target_route(argos_tr, target):
-        cprint(f"  {ok_tag()} Offline model en -> {target} is ready in {models_dir}.")
-        return argos_tr
-
-    cprint_step(
-        f"  {bracket_tag('FETCH', SOFT_YELLOW)} Downloading offline model en -> {target} into {models_dir}..."
-    )
-    try:
+    if not has_route():
+        print(f"STATUS:Downloading model en->{target_lang}...", flush=True)
         argos_pkg.update_package_index()
         available = argos_pkg.get_available_packages()
-        pkg = next(
-            (p for p in available if p.from_code == "en" and p.to_code == target),
-            None,
-        )
+        pkg = next((p for p in available if p.from_code == "en" and p.to_code == target_lang), None)
         if pkg is None:
-            cprint(
-                f"  {err_tag()} No offline model available in Argos index for direction en -> {target}."
-            )
-            return None
-
+            print(f"ERR:No offline model available for en->{target_lang}", file=sys.stderr)
+            sys.exit(3)
         dl_path = pkg.download()
         if not dl_path or not Path(dl_path).is_file():
-            cprint(f"  {err_tag()} Model download failed for en -> {target}.")
-            return None
-
+            print(f"ERR:Model download failed for en->{target_lang}", file=sys.stderr)
+            sys.exit(4)
         argos_pkg.install_from_path(dl_path)
-    except Exception as e:
-        cprint(f"  {err_tag()} Failed to download or install model en -> {target}: {e}")
-        return None
-
-    _sync_argos_settings_dirs(models_dir)
-    try:
         importlib.reload(argos_pkg)
         importlib.reload(argos_tr)
-    except Exception:
-        pass
+        if not has_route():
+            print(f"ERR:Route en->{target_lang} not loaded after install", file=sys.stderr)
+            sys.exit(5)
 
-    if _has_en_to_target_route(argos_tr, target):
-        cprint_step(f"  {ok_tag()} Offline model en -> {target} installed into {models_dir}.")
-        return argos_tr
+    langs = argos_tr.get_installed_languages()
+    en_l = next(l for l in langs if getattr(l, "code", None) == "en")
+    to_l = next(l for l in langs if getattr(l, "code", None) == target_lang)
+    tr_obj = en_l.get_translation(to_l)
+    translate_fn = tr_obj.translate if tr_obj is not None else (lambda t: argos_tr.translate(t, "en", target_lang))
 
-    cprint(
-        f"  {err_tag()} Model package en -> {target} was installed into {models_dir}, "
-        f"but route en -> {target} was not loaded."
-    )
-    return None
+    raw_content = en_srt_path.read_text(encoding="utf-8", errors="replace")
+    blocks = BLOCK_SPLIT_RE.split(raw_content.strip())
+    parsed_blocks = []
+    total_lines = 0
+    for blk in blocks:
+        lines = [ln.rstrip("\r") for ln in blk.splitlines()]
+        if len(lines) >= 3 and "-->" in lines[1]:
+            txt_lines = lines[2:]
+            parsed_blocks.append((lines[0].strip(), lines[1].strip(), txt_lines))
+            total_lines += sum(1 for t in txt_lines if t.strip())
+        elif lines:
+            parsed_blocks.append(("", "", lines))
+
+    if total_lines == 0:
+        print("ERR:Source SRT has no translatable lines", file=sys.stderr)
+        sys.exit(6)
+
+    done_lines = 0
+    translated_ok = 0
+    fallback_lines = 0
+    cache = {}
+    out_blocks = []
+    last_report = 0.0
+
+    for idx_line, ts_line, txt_lines in parsed_blocks:
+        if not ts_line:
+            out_blocks.append("\n".join(txt_lines))
+            continue
+
+        tr_lines = []
+        for ln in txt_lines:
+            stripped = ln.strip()
+            if not stripped:
+                tr_lines.append("")
+                continue
+
+            res = cache.get(stripped)
+            if res is None:
+                try:
+                    raw_tr = translate_fn(stripped)
+                    res = " ".join((raw_tr or "").splitlines()).strip()
+                except Exception:
+                    res = ""
+                cache[stripped] = res
+
+            if res:
+                tr_lines.append(res)
+                translated_ok += 1
+            else:
+                tr_lines.append(stripped)
+                fallback_lines += 1
+
+            done_lines += 1
+            now = time.monotonic()
+            if now - last_report >= 0.15:
+                last_report = now
+                print(f"PROGRESS:{done_lines}/{total_lines}", flush=True)
+
+        out_blocks.append(f"{idx_line}\n{ts_line}\n" + "\n".join(tr_lines))
+
+    out_srt_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_out = out_srt_path.with_suffix(".part.srt")
+    with open(temp_out, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n\n".join(out_blocks) + "\n")
+    os.replace(temp_out, out_srt_path)
+
+    print(f"PROGRESS:{total_lines}/{total_lines}", flush=True)
+    print(f"DONE:{translated_ok}/{total_lines}:{fallback_lines}", flush=True)
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def _ensure_argostranslate_via_pip(pkg_dir: Path, models_dir: Path) -> bool:
+    """Install `argostranslate` into `pkg_dir` using an external Python/pip if not already present."""
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    if (pkg_dir / "argostranslate").is_dir():
+        cprint(f"  {ok_tag()} Package 'argostranslate' found in {pkg_dir}.")
+        return True
+
+    pip_cmds = _find_external_pip_commands()
+    if not pip_cmds:
+        cprint(
+            f"  {err_tag()} Cannot install 'argostranslate': no external Python/pip found."
+        )
+        return False
+
+    cprint_step(f"  {info_tag()} Installing 'argostranslate' into {pkg_dir} via pip...")
+    bar_state = {"last_len": 0}
+    start_ts = time.time()
+    installed_cnt = 0
+    last_rc = 1
+    last_tail = "no output captured"
+
+    for base_cmd in pip_cmds:
+        cmd = base_cmd + [
+            "install",
+            "--upgrade",
+            "--no-warn-script-location",
+            "--target",
+            str(pkg_dir),
+            "argostranslate",
+        ]
+        recent_lines: list[str] = []
+        installed_cnt = 0
+        start_ts = time.time()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as e:
+            last_tail = str(e)
+            continue
+
+        try:
+            if proc.stdout:
+                for raw_line in proc.stdout:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    recent_lines.append(line)
+                    if len(recent_lines) > 12:
+                        recent_lines.pop(0)
+
+                    if line.startswith("Collecting "):
+                        pkg_name = line.split("Collecting ", 1)[1].split()[0]
+                        write_live_line(
+                            f"    [pip] Resolving {pkg_name}... ({time.time() - start_ts:.0f}s)",
+                            bar_state,
+                            newline=False,
+                        )
+                    elif line.startswith("Installing collected packages:"):
+                        pkgs = [p.strip() for p in line.split(":", 1)[1].split(",") if p.strip()]
+                        installed_cnt = len(pkgs)
+                        write_live_line(
+                            f"    [pip] Installing {installed_cnt} packages into {pkg_dir}...",
+                            bar_state,
+                            newline=False,
+                        )
+                    elif line.startswith("ERROR:"):
+                        finish_live_line_if_needed(bar_state)
+                        cprint(f"    {warn_tag()} {line}")
+            rc = proc.wait()
+        except KeyboardInterrupt:
+            finish_live_line_if_needed(bar_state)
+            if proc.poll() is None:
+                proc.terminate()
+            raise
+
+        finish_live_line_if_needed(bar_state)
+        last_rc = rc
+        if rc == 0 and (pkg_dir / "argostranslate").is_dir():
+            cprint_step(
+                f"  {ok_tag()} Package 'argostranslate' installed in {time.time() - start_ts:.1f}s ({installed_cnt} pkgs)."
+            )
+            return True
+        if recent_lines:
+            last_tail = " | ".join(recent_lines[-3:])
+
+    cprint(f"  {err_tag()} Cannot install 'argostranslate' (pip exit code {last_rc}): {last_tail}")
+    return False
 
 
 def translate_srt_file_offline(
@@ -628,139 +819,150 @@ def translate_srt_file_offline(
     models_dir: Path,
     pkg_dir: Path,
 ) -> bool:
-    """Translate `<name>_en.srt` into `<name>_<target_lang>.srt` with animated progress bar."""
+    """Translate SRT using Argos Translate inside an external Python process."""
     if not en_srt_path.is_file() or en_srt_path.stat().st_size <= 0:
-        cprint(f"  {err_tag()} Source English SRT is missing or empty: {en_srt_path}")
+        cprint(f"  {err_tag()} Source SRT is missing or empty: {en_srt_path}")
         return False
 
     target = normalize_lang_code(target_lang)
-    argos_tr = ensure_argos_en_to_target_module(models_dir, pkg_dir, target)
-    if argos_tr is None:
-        cprint(f"  {warn_tag()} Offline translation en -> {target} could not proceed.")
+    if not _ensure_argostranslate_via_pip(pkg_dir, models_dir):
+        cprint(f"  {warn_tag()} Skipping offline translation because 'argostranslate' is unavailable.")
+        return False
+
+    py_cmds = _find_external_python_executables()
+    if not py_cmds:
+        cprint(
+            f"  {err_tag()} Cannot run offline translation: no external python.exe found to run argostranslate."
+        )
         return False
 
     cprint_step(
         f"\n=== Translating subtitles {en_srt_path.name} -> {out_srt_path.name} (offline model) ==="
     )
-    raw_content = en_srt_path.read_text(encoding="utf-8", errors="replace")
-    blocks = re.split(r"\r?\n\r?\n", raw_content.strip())
 
-    parsed_blocks: list[tuple[str, str, list[str]]] = []
-    text_lines_total = 0
-
-    for blk in blocks:
-        lines = [ln.rstrip("\r") for ln in blk.splitlines()]
-        if len(lines) >= 3 and "-->" in lines[1]:
-            idx_line = lines[0].strip()
-            ts_line = lines[1].strip()
-            txt_lines = lines[2:]
-            parsed_blocks.append((idx_line, ts_line, txt_lines))
-            text_lines_total += sum(1 for t in txt_lines if t.strip())
-        elif lines:
-            parsed_blocks.append(("", "", lines))
-
-    if not parsed_blocks or text_lines_total == 0:
-        cprint(f"  {err_tag()} Source English SRT contains no translatable subtitle text.")
-        return False
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
+        tf.write(_WORKER_SCRIPT)
+        worker_path = Path(tf.name)
 
     start_wall = time.time()
     bar_state = {"last_len": 0}
-    state_lock = threading.Lock()
-    done_lines = 0
-    translated_ok = 0
-    fallback_lines = 0
-    out_blocks: list[str] = []
-    stop_ticker = threading.Event()
-
-    def render_translate_line(done: bool = False) -> str:
-        with state_lock:
-            cur = done_lines
-        elapsed = time.time() - start_wall
-        return format_time_progress_bar(
-            cur_sec=float(text_lines_total if done else cur),
-            total_sec=float(max(1, text_lines_total)),
-            elapsed_sec=elapsed,
-            label=f"Translating EN->{target}",
-            done=done,
-        )
-
-    def ticker_loop():
-        while not stop_ticker.is_set():
-            write_live_line(render_translate_line(done=False), bar_state, newline=False)
-            stop_ticker.wait(0.12)
-
-    t_tick = threading.Thread(target=ticker_loop, daemon=True)
-    t_tick.start()
+    last_err = ""
 
     try:
-        for idx_line, ts_line, txt_lines in parsed_blocks:
-            if not ts_line:
-                out_blocks.append("\n".join(txt_lines))
+        for py_cmd in py_cmds:
+            cmd = py_cmd + [
+                str(worker_path),
+                str(en_srt_path),
+                str(out_srt_path),
+                target,
+                str(models_dir),
+                str(pkg_dir),
+            ]
+            err_lines: list[str] = []
+            done_summary = ""
+            total_est = 1
+            cur_est = 0
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except OSError as e:
+                last_err = str(e)
                 continue
 
-            translated_lines: list[str] = []
-            for ln in txt_lines:
-                stripped = ln.strip()
-                if not stripped:
-                    translated_lines.append("")
-                    continue
-                try:
-                    tr_raw = argos_tr.translate(stripped, "en", target)
-                    tr_clean = " ".join((tr_raw or "").splitlines()).strip()
-                    if tr_clean:
-                        translated_lines.append(tr_clean)
-                        translated_ok += 1
-                    else:
-                        translated_lines.append(stripped)
-                        fallback_lines += 1
-                except Exception:
-                    translated_lines.append(stripped)
-                    fallback_lines += 1
+            def _read_err():
+                if proc.stderr:
+                    for ln in proc.stderr:
+                        s = ln.strip()
+                        if s:
+                            err_lines.append(s)
 
-                with state_lock:
-                    done_lines += 1
-                write_live_line(render_translate_line(done=False), bar_state, newline=False)
+            t_err = threading.Thread(target=_read_err, daemon=True)
+            t_err.start()
 
-            block_str = f"{idx_line}\n{ts_line}\n" + "\n".join(translated_lines)
-            out_blocks.append(block_str)
-    finally:
-        stop_ticker.set()
-        t_tick.join(timeout=1)
+            try:
+                if proc.stdout:
+                    for raw_line in proc.stdout:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("STATUS:"):
+                            finish_live_line_if_needed(bar_state)
+                            cprint(f"  {info_tag()} {line.split(':', 1)[1]}")
+                        elif line.startswith("PROGRESS:"):
+                            parts = line.split(":", 1)[1].split("/")
+                            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                                cur_est = int(parts[0])
+                                total_est = max(1, int(parts[1]))
+                                write_live_line(
+                                    format_time_progress_bar(
+                                        cur_sec=float(cur_est),
+                                        total_sec=float(total_est),
+                                        elapsed_sec=time.time() - start_wall,
+                                        label=f"Translating EN->{target}",
+                                        done=False,
+                                    ),
+                                    bar_state,
+                                    newline=False,
+                                )
+                        elif line.startswith("DONE:"):
+                            done_summary = line.split(":", 1)[1]
+                rc = proc.wait()
+            except KeyboardInterrupt:
+                finish_live_line_if_needed(bar_state)
+                if proc.poll() is None:
+                    proc.terminate()
+                raise
+            finally:
+                t_err.join(timeout=2)
 
-    out_srt_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_out = out_srt_path.with_suffix(".part.srt")
-    try:
-        with open(temp_out, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write("\n\n".join(out_blocks) + "\n")
-        os.replace(temp_out, out_srt_path)
-    except Exception as e:
-        finish_live_line_if_needed(bar_state)
-        temp_out.unlink(missing_ok=True)
-        cprint(f"  {err_tag()} Failed to write translated SRT file {out_srt_path}: {e}")
+            finish_live_line_if_needed(bar_state)
+            if rc == 0 and _file_nonempty(out_srt_path):
+                write_live_line(
+                    format_time_progress_bar(
+                        cur_sec=float(total_est),
+                        total_sec=float(total_est),
+                        elapsed_sec=time.time() - start_wall,
+                        label=f"Translating EN->{target}",
+                        done=True,
+                    ),
+                    bar_state,
+                    newline=True,
+                )
+                cprint_step(
+                    f"  {ok_tag()} Translated SRT saved in {time.time() - start_wall:.1f}s ({done_summary}): {out_srt_path}"
+                )
+                return True
+
+            if err_lines:
+                last_err = err_lines[-1]
+            else:
+                last_err = f"worker exited with code {rc}"
+
+        cprint(f"  {err_tag()} Offline translation failed: {last_err}")
+        cprint(f"  {warn_tag()} Offline translation en -> {target} could not proceed.")
         return False
-
-    elapsed = time.time() - start_wall
-    write_live_line(render_translate_line(done=True), bar_state, newline=True)
-
-    summary = f"translated={translated_ok}/{text_lines_total}"
-    if fallback_lines > 0:
-        summary += f", fallback_en={fallback_lines}"
-    cprint_step(f"  {ok_tag()} Translated SRT saved in {elapsed:.1f}s ({summary}): {out_srt_path}")
-    return True
+    finally:
+        worker_path.unlink(missing_ok=True)
 
 
 # ==============================================================================
 # LANGUAGE PROMPT & EXISTING SRT SELECTION (WITH 15s AUTO TIMEOUT)
 # ==============================================================================
 def print_all_supported_languages() -> None:
-    """Print all supported language codes in columns."""
     cprint(f"\n--- Supported language codes ({len(SUPPORTED_LANGUAGES)} total) ---")
     items = [f"{code}: {name}" for code, name in sorted(SUPPORTED_LANGUAGES.items())]
     cols = 4
     col_width = 24
     for i in range(0, len(items), cols):
         row = "".join(entry.ljust(col_width) for entry in items[i : i + cols])
-        cprint(f"  {row.rstrip()}")
+        cprint_dim(f"  {row.rstrip()}")
 
 
 def _input_with_idle_timeout(
@@ -768,77 +970,63 @@ def _input_with_idle_timeout(
 ) -> tuple[str | None, bool]:
     deadline = time.monotonic() + timeout_sec
     last_shown = -1
+    clear_line = "\r" + " " * 110 + "\r"
+
+    def tick() -> bool:
+        nonlocal last_shown
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            sys.stdout.write(clear_line)
+            sys.stdout.flush()
+            return False
+        sec_left = int(remaining) + 1
+        if sec_left != last_shown:
+            last_shown = sec_left
+            sys.stdout.write(f"\r[{sec_left:2d}s -> {timeout_hint}] {prompt_text}")
+            sys.stdout.flush()
+        return True
 
     if os.name == "nt":
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                sys.stdout.write("\r" + " " * 110 + "\r")
-                sys.stdout.flush()
+            if not tick():
                 return None, True
-
-            sec_left = int(remaining) + 1
-            if sec_left != last_shown:
-                last_shown = sec_left
-                msg = colorize_message(f"[{sec_left:2d}s -> {timeout_hint}] {prompt_text}", important=True)
-                sys.stdout.write(f"\r{msg}")
-                sys.stdout.flush()
-
             if msvcrt.kbhit():
-                sys.stdout.write("\r" + " " * 110 + "\r")
+                sys.stdout.write(clear_line)
                 sys.stdout.flush()
-                return input(colorize_message(prompt_text, important=True)), False
-
+                return input(prompt_text), False
             time.sleep(0.05)
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
-    key_pressed = False
     try:
         tty.setcbreak(fd)
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                sys.stdout.write("\r" + " " * 110 + "\r")
-                sys.stdout.flush()
+            if not tick():
                 return None, True
-
-            sec_left = int(remaining) + 1
-            if sec_left != last_shown:
-                last_shown = sec_left
-                msg = colorize_message(f"[{sec_left:2d}s -> {timeout_hint}] {prompt_text}", important=True)
-                sys.stdout.write(f"\r{msg}")
-                sys.stdout.flush()
-
             rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
             if rlist:
-                key_pressed = True
                 break
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-    if key_pressed:
-        sys.stdout.write("\r" + " " * 110 + "\r")
-        sys.stdout.flush()
-        return input(colorize_message(prompt_text, important=True)), False
-
-    return None, True
+    sys.stdout.write(clear_line)
+    sys.stdout.flush()
+    return input(prompt_text), False
 
 
 def prompt_translate_single_existing_srt(
     existing_srt: Path,
     media_stem: str,
+    subs_dir: Path | None = None,
     timeout_sec: int = PROMPT_TIMEOUT_SEC,
 ) -> tuple[bool, str | None]:
     if not sys.stdin.isatty():
         return False, None
 
-    lang_info = extract_lang_label_from_srt(existing_srt, media_stem)
+    lang_info = extract_lang_label_from_srt(existing_srt, media_stem, subs_dir=subs_dir)
     cprint_step(f"\n=== Existing SRT found: {existing_srt.name} [{lang_info}] ===")
-    cprint(
-        f"  {bracket_tag('INFO', SOFT_CYAN)} Press Enter or wait {timeout_sec}s to play with {existing_srt.name}."
-    )
-    cprint("  Type 'y' to choose a target language, or enter a language code directly (e.g. sk, cs, de).")
+    cprint(f"  {info_tag()} Press Enter or wait {timeout_sec}s to play with {existing_srt.name}.")
+    cprint_dim("  Type 'y' to choose a target language, or enter a language code directly (e.g. sk, cs, de).")
 
     prompt_str = "Translate subtitles to another language? [y/N/lang]: "
     first_attempt = True
@@ -852,12 +1040,12 @@ def prompt_translate_single_existing_srt(
                 )
                 if timed_out:
                     cprint_step(
-                        f"  {bracket_tag('INFO', SOFT_YELLOW)} Prompt timeout ({timeout_sec}s) reached -> "
+                        f"  {info_tag()} Prompt timeout ({timeout_sec}s) reached -> "
                         f"playing with {existing_srt.name}."
                     )
                     return False, None
             else:
-                raw = input(colorize_message(prompt_str, important=True))
+                raw = input(prompt_str)
         except EOFError:
             return False, None
 
@@ -886,52 +1074,57 @@ def prompt_translate_single_existing_srt(
 def prompt_select_existing_srt(
     existing_srts: list[Path],
     media_stem: str,
+    subs_dir: Path | None = None,
     timeout_sec: int = PROMPT_TIMEOUT_SEC,
 ) -> Path | None:
-    en_target = next(
+    default_target = next(
+        (p for p in existing_srts if p.stem.lower() == media_stem.lower()),
+        None,
+    ) or next(
         (p for p in existing_srts if p.name.lower() == f"{media_stem}_en.srt".lower()),
         existing_srts[0],
     )
 
     if not sys.stdin.isatty():
-        return en_target
+        return default_target
 
-    cprint_step(f"\n=== Multiple subtitles found in {CACHE_DIR_NAME}/{SUBS_DIR_NAME} ===")
+    cprint_step(f"\n=== Found {len(existing_srts)} subtitles for '{media_stem}' — select which to use ===")
     for idx, p in enumerate(existing_srts, start=1):
-        lang_info = extract_lang_label_from_srt(p, media_stem)
-        default_mark = "  <-- default on timeout/Enter" if p == en_target else ""
+        lang_info = extract_lang_label_from_srt(p, media_stem, subs_dir=subs_dir)
+        default_mark = "  <-- default on timeout/Enter" if p == default_target else ""
         cprint(f"    {idx:2d}) {p.name} [{lang_info}]{default_mark}")
     cprint("   new) Translate / generate subtitles in another language")
     cprint(
-        f"  {bracket_tag('INFO', SOFT_CYAN)} If nothing is entered within {timeout_sec}s (or Enter is pressed), "
-        f"auto-selecting: {en_target.name}"
+        f"  {info_tag()} If nothing is entered within {timeout_sec}s (or Enter is pressed), "
+        f"auto-selecting: {default_target.name}"
     )
 
-    prompt_str = f"Select subtitle number (1..{len(existing_srts)}), language code, or 'new': "
+    prompt_str = f"Which subtitles to use? Select number (1..{len(existing_srts)}), language code, or 'new': "
     first_attempt = True
+    by_lower_name = {p.name.lower(): p for p in existing_srts}
 
     while True:
         try:
             if first_attempt:
                 first_attempt = False
                 raw, timed_out = _input_with_idle_timeout(
-                    prompt_str, timeout_sec, f"auto {en_target.name}"
+                    prompt_str, timeout_sec, f"auto {default_target.name}"
                 )
                 if timed_out:
                     cprint_step(
-                        f"  {bracket_tag('INFO', SOFT_YELLOW)} Prompt timeout ({timeout_sec}s) reached -> "
-                        f"auto-selecting {en_target.name}."
+                        f"  {info_tag()} Prompt timeout ({timeout_sec}s) reached -> "
+                        f"auto-selecting {default_target.name}."
                     )
-                    return en_target
+                    return default_target
             else:
-                raw = input(colorize_message(prompt_str, important=True))
+                raw = input(prompt_str)
         except EOFError:
-            return en_target
+            return default_target
 
         raw = (raw or "").strip()
         if not raw:
-            cprint_step(f"  {ok_tag()} Selected default subtitles: {en_target.name}")
-            return en_target
+            cprint_step(f"  {ok_tag()} Selected default subtitles: {default_target.name}")
+            return default_target
 
         lower = raw.lower()
         if lower in ("new", "n", "gen", "generate", "tr", "translate"):
@@ -944,10 +1137,11 @@ def prompt_select_existing_srt(
                 cprint_step(f"  {ok_tag()} Selected subtitles: {chosen.name}")
                 return chosen
 
-        for p in existing_srts:
-            if p.name.lower() == f"{media_stem}_{lower}.srt".lower():
-                cprint_step(f"  {ok_tag()} Selected subtitles: {p.name}")
-                return p
+        for sep in ("_", "."):
+            chosen = by_lower_name.get(f"{media_stem}{sep}{lower}.srt".lower())
+            if chosen is not None:
+                cprint_step(f"  {ok_tag()} Selected subtitles: {chosen.name}")
+                return chosen
 
         cprint(
             f"  {warn_tag()} Invalid selection '{raw}'. Enter 1..{len(existing_srts)}, a language code, or 'new'."
@@ -965,14 +1159,14 @@ def prompt_target_language(
         "\n=== Subtitle Language (base EN SRT first, offline EN -> target translation for others) ==="
     )
     cprint(
-        f"  {bracket_tag('INFO', SOFT_CYAN)} If nothing is entered within {timeout_sec}s, "
+        f"  {info_tag()} If nothing is entered within {timeout_sec}s, "
         f"defaulting to '{default_lang}'."
     )
     cprint("  Quick selection:")
     for idx, (code, desc) in enumerate(QUICK_LANGUAGES, start=1):
         cprint(f"    {idx:2d}) {code:<4} - {desc}")
     cprint("   list) Show all supported language codes")
-    cprint(f"  Enter = default ({default_lang})")
+    cprint_dim(f"  Enter = default ({default_lang})")
 
     prompt_str = "Enter number, language code (e.g. en, sk, cs, de), or 'list': "
     first_attempt = True
@@ -986,12 +1180,12 @@ def prompt_target_language(
                 )
                 if timed_out:
                     cprint_step(
-                        f"  {bracket_tag('INFO', SOFT_YELLOW)} Prompt timeout ({timeout_sec}s) reached -> "
+                        f"  {info_tag()} Prompt timeout ({timeout_sec}s) reached -> "
                         f"auto-selecting '{default_lang}'."
                     )
                     return default_lang
             else:
-                raw = input(colorize_message(prompt_str, important=True))
+                raw = input(prompt_str)
         except EOFError:
             return default_lang
 
@@ -1025,13 +1219,7 @@ def prompt_target_language(
 # ==============================================================================
 # HARDWARE DETECTION
 # ==============================================================================
-TIMESTAMP_LINE_RE = re.compile(
-    r"\[(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})\]\s*(.*)"
-)
-
-
 def detect_hardware() -> dict:
-    """Detect CPU core count and NVIDIA GPU availability/free VRAM."""
     cpu_threads = os.cpu_count() or 4
     gpu_info = {
         "has_nvidia": False,
@@ -1093,34 +1281,30 @@ def get_work_dir() -> Path:
     return Path.cwd()
 
 
+def _ensure_subdir(parent: Path, name: str) -> Path:
+    d = parent / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def get_cache_dir(work_dir: Path) -> Path:
-    cache_dir = work_dir / CACHE_DIR_NAME
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
+    return _ensure_subdir(work_dir, CACHE_DIR_NAME)
 
 
 def get_subs_dir(cache_dir: Path) -> Path:
-    subs_dir = cache_dir / SUBS_DIR_NAME
-    subs_dir.mkdir(parents=True, exist_ok=True)
-    return subs_dir
+    return _ensure_subdir(cache_dir, SUBS_DIR_NAME)
 
 
 def get_audio_dir(cache_dir: Path) -> Path:
-    audio_dir = cache_dir / AUDIO_DIR_NAME
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    return audio_dir
+    return _ensure_subdir(cache_dir, AUDIO_DIR_NAME)
 
 
 def get_argos_models_dir(cache_dir: Path) -> Path:
-    models_dir = cache_dir / ARGOS_MODELS_DIR_NAME
-    models_dir.mkdir(parents=True, exist_ok=True)
-    return models_dir
+    return _ensure_subdir(cache_dir, ARGOS_MODELS_DIR_NAME)
 
 
 def get_argos_pkg_dir(cache_dir: Path) -> Path:
-    pkg_dir = cache_dir / ARGOS_PKG_DIR_NAME
-    pkg_dir.mkdir(parents=True, exist_ok=True)
-    return pkg_dir
+    return _ensure_subdir(cache_dir, ARGOS_PKG_DIR_NAME)
 
 
 def resolve_tool_path(cache_dir: Path, work_dir: Path, filename: str) -> Path:
@@ -1134,18 +1318,18 @@ def resolve_tool_path(cache_dir: Path, work_dir: Path, filename: str) -> Path:
 
 
 def cleanup_wav_file(wav_path: Path, reason: str = "") -> None:
-    """Remove temporary WAV file once no longer needed."""
-    if wav_path.exists():
-        try:
-            wav_path.unlink()
-            suffix = f" ({reason})" if reason else ""
-            cprint(f"  {bracket_tag('INFO', SOFT_CYAN)} Removed temporary WAV{suffix}: {wav_path.name}")
-        except Exception as e:
-            cprint(f"  {warn_tag()} Could not remove temporary WAV {wav_path}: {e}")
+    try:
+        wav_path.unlink()
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        cprint(f"  {warn_tag()} Could not remove temporary WAV {wav_path}: {e}")
+        return
+    suffix = f" ({reason})" if reason else ""
+    cprint(f"  {info_tag()} Removed temporary WAV{suffix}: {wav_path.name}")
 
 
 def get_wav_duration_sec(wav_path: Path) -> float | None:
-    """Return WAV duration in seconds."""
     try:
         with wave.open(str(wav_path), "rb") as wf:
             frames = wf.getnframes()
@@ -1170,7 +1354,6 @@ def http_get_json(url: str, timeout: int = 20):
 
 
 def download_file(url: str, dest_path: Path, label: str = "") -> bool:
-    """Download a file from `url` to `dest_path` with a live progress bar."""
     if not url:
         return False
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1186,33 +1369,41 @@ def download_file(url: str, dest_path: Path, label: str = "") -> bool:
             downloaded = 0
             start_time = time.time()
             last_print = 0.0
+            read = resp.read
+            write = out.write
 
             while True:
-                buf = resp.read(1024 * 128)
+                buf = read(DOWNLOAD_CHUNK)
                 if not buf:
                     break
-                out.write(buf)
+                write(buf)
                 downloaded += len(buf)
                 now = time.time()
                 if now - last_print >= 0.12:
                     last_print = now
-                    line = format_pip_progress_bar(
-                        downloaded=downloaded,
-                        total_bytes=total_bytes,
-                        elapsed_sec=now - start_time,
-                        label=label,
-                        done=False,
+                    write_live_line(
+                        format_pip_progress_bar(
+                            downloaded=downloaded,
+                            total_bytes=total_bytes,
+                            elapsed_sec=now - start_time,
+                            label=label,
+                            done=False,
+                        ),
+                        bar_state,
+                        newline=False,
                     )
-                    write_live_line(line, bar_state, newline=False)
 
-            final_line = format_pip_progress_bar(
-                downloaded=downloaded,
-                total_bytes=total_bytes or downloaded,
-                elapsed_sec=time.time() - start_time,
-                label=label,
-                done=True,
+            write_live_line(
+                format_pip_progress_bar(
+                    downloaded=downloaded,
+                    total_bytes=total_bytes or downloaded,
+                    elapsed_sec=time.time() - start_time,
+                    label=label,
+                    done=True,
+                ),
+                bar_state,
+                newline=True,
             )
-            write_live_line(final_line, bar_state, newline=True)
 
         if dest_path.stat().st_size == 0:
             cprint(f"  {err_tag()} Downloaded file for {label} is empty.")
@@ -1245,7 +1436,7 @@ def find_latest_ffmpeg_win64_zip_url() -> str:
                 ):
                     return url
     except Exception as e:
-        cprint(f"  {bracket_tag('INFO', SOFT_CYAN)} GitHub API for FFmpeg unavailable ({e}).")
+        cprint(f"  {info_tag()} GitHub API for FFmpeg unavailable ({e}).")
     return ""
 
 
@@ -1282,7 +1473,7 @@ def find_latest_whisper_zip_url(prefer_cuda: bool) -> tuple[str, str]:
                     ):
                         return url, "cpu"
     except Exception as e:
-        cprint(f"  {bracket_tag('INFO', SOFT_CYAN)} GitHub API for whisper.cpp unavailable ({e}).")
+        cprint(f"  {info_tag()} GitHub API for whisper.cpp unavailable ({e}).")
 
     if prefer_cuda and FALLBACK_URLS.get("whisper_cuda_zip"):
         return FALLBACK_URLS["whisper_cuda_zip"], "cuda"
@@ -1294,53 +1485,45 @@ def find_latest_whisper_zip_url(prefer_cuda: bool) -> tuple[str, str]:
 def extract_zip_and_copy_exe(
     archive_path: Path, candidate_names: list[str], target_exe_name: str, cache_dir: Path
 ) -> bool:
-    extract_tmp = cache_dir / f"_tmp_zip_{target_exe_name}"
-    if extract_tmp.exists():
-        shutil.rmtree(extract_tmp, ignore_errors=True)
-    extract_tmp.mkdir(parents=True, exist_ok=True)
-
     try:
         if not zipfile.is_zipfile(archive_path):
             cprint(f"  {err_tag()} {archive_path.name} is not a valid ZIP archive.")
             return False
 
         with zipfile.ZipFile(archive_path, "r") as zf:
-            zf.extractall(extract_tmp)
+            members = [i for i in zf.infolist() if not i.is_dir()]
+            by_base: dict[str, zipfile.ZipInfo] = {}
+            for info in members:
+                by_base.setdefault(posixpath.basename(info.filename).lower(), info)
 
-        found_file = None
-        lower_candidates = [c.lower() for c in candidate_names]
-
-        for cand in lower_candidates:
-            for root, _, files in os.walk(extract_tmp):
-                for f in files:
-                    if f.lower() == cand:
-                        found_file = Path(root) / f
-                        break
-                if found_file:
-                    break
-            if found_file:
-                break
-
-        if not found_file:
-            cprint(
-                f"  {err_tag()} None of the expected executables were found in archive: {', '.join(candidate_names)}"
+            found = next(
+                (by_base[c.lower()] for c in candidate_names if c.lower() in by_base), None
             )
-            return False
+            if found is None:
+                cprint(
+                    f"  {err_tag()} None of the expected executables were found in archive: {', '.join(candidate_names)}"
+                )
+                return False
 
-        for item in found_file.parent.iterdir():
-            if item.is_file():
-                shutil.copy2(item, cache_dir / item.name)
+            parent = posixpath.dirname(found.filename)
+            for info in members:
+                if posixpath.dirname(info.filename) != parent:
+                    continue
+                with zf.open(info) as src, open(
+                    cache_dir / posixpath.basename(info.filename), "wb"
+                ) as dst:
+                    shutil.copyfileobj(src, dst, DOWNLOAD_CHUNK)
 
-        dest_exe = cache_dir / target_exe_name
-        if found_file.name.lower() != target_exe_name.lower():
-            shutil.copy2(found_file, dest_exe)
+            dest_exe = cache_dir / target_exe_name
+            if posixpath.basename(found.filename).lower() != target_exe_name.lower():
+                with zf.open(found) as src, open(dest_exe, "wb") as dst:
+                    shutil.copyfileobj(src, dst, DOWNLOAD_CHUNK)
 
         return dest_exe.is_file()
     except Exception as e:
         cprint(f"  {err_tag()} Failed while extracting ZIP archive: {e}")
         return False
     finally:
-        shutil.rmtree(extract_tmp, ignore_errors=True)
         archive_path.unlink(missing_ok=True)
 
 
@@ -1362,9 +1545,10 @@ def try_extract_7z_if_possible(archive_path: Path, target_exe_name: str, cache_d
         )
         if res.returncode != 0:
             return False
+        target_lower = target_exe_name.lower()
         for root, _, files in os.walk(extract_tmp):
             for f in files:
-                if f.lower() == target_exe_name.lower():
+                if f.lower() == target_lower:
                     found = Path(root) / f
                     for item in found.parent.iterdir():
                         if item.is_file():
@@ -1384,10 +1568,10 @@ def ensure_ffmpeg(cache_dir: Path, work_dir: Path) -> bool:
         cprint(f"  {ok_tag()} ffmpeg.exe found in current directory.")
         return True
 
-    cprint_step(f"  {bracket_tag('MISSING', SOFT_YELLOW)} ffmpeg.exe -> searching for latest Windows build...")
+    cprint_step(f"  {warn_tag('MISSING')} ffmpeg.exe -> searching for latest Windows build...")
     url = find_latest_ffmpeg_win64_zip_url() or FALLBACK_URLS["ffmpeg_zip"]
     if not url:
-        cprint("    -> Could not resolve download URL for ffmpeg.exe.")
+        cprint_dim("    -> Could not resolve download URL for ffmpeg.exe.")
         return False
 
     tmp_zip = cache_dir / "_dl_ffmpeg.zip"
@@ -1401,13 +1585,10 @@ def ensure_ffmpeg(cache_dir: Path, work_dir: Path) -> bool:
 
 
 def get_cached_whisper_mode(cache_dir: Path) -> str:
-    marker = cache_dir / WHISPER_MODE_MARKER
-    if marker.is_file():
-        try:
-            return marker.read_text(encoding="utf-8").strip().lower()
-        except Exception:
-            return ""
-    return ""
+    try:
+        return (cache_dir / WHISPER_MODE_MARKER).read_text(encoding="utf-8").strip().lower()
+    except Exception:
+        return ""
 
 
 def set_cached_whisper_mode(cache_dir: Path, mode: str) -> None:
@@ -1422,28 +1603,30 @@ def ensure_whisper(cache_dir: Path, work_dir: Path, prefer_cuda: bool) -> bool:
     current_mode = get_cached_whisper_mode(cache_dir)
 
     if exe.is_file():
-        if prefer_cuda and current_mode == "cuda":
-            cprint(f"  {ok_tag()} whisper.exe (CUDA/NVIDIA build) found in .cache.")
+        if prefer_cuda and current_mode in ("cuda", "cpu_checked"):
+            label = "CUDA/NVIDIA build" if current_mode == "cuda" else "CPU build, no CUDA release available"
+            cprint(f"  {ok_tag()} whisper.exe ({label}) found in .cache.")
             return True
-        if not prefer_cuda and current_mode in ("cpu", ""):
+        if not prefer_cuda and current_mode in ("cpu", "", "cpu_checked", "cuda"):
             cprint(f"  {ok_tag()} whisper.exe found in .cache.")
             return True
-        if prefer_cuda and current_mode != "cuda":
+        if prefer_cuda:
             cprint_step(
-                f"  {bracket_tag('INFO', SOFT_YELLOW)} NVIDIA GPU detected, upgrading whisper.exe in .cache to CUDA build..."
+                f"  {info_tag()} NVIDIA GPU detected, upgrading whisper.exe in .cache to CUDA build..."
             )
     elif (work_dir / "whisper.exe").is_file() and not prefer_cuda:
         cprint(f"  {ok_tag()} whisper.exe found in current directory.")
         return True
 
     target_desc = "NVIDIA CUDA build" if prefer_cuda else "latest whisper.cpp release"
-    cprint_step(f"  {bracket_tag('FETCH', SOFT_YELLOW)} whisper.exe -> searching {target_desc}...")
+    cprint_step(f"  {info_tag('FETCH')} whisper.exe -> searching {target_desc}...")
     url, resolved_mode = find_latest_whisper_zip_url(prefer_cuda=prefer_cuda)
     if not url:
         if exe.is_file():
             cprint(f"    -> {warn_tag()} No CUDA build found in releases; keeping existing whisper.exe.")
+            set_cached_whisper_mode(cache_dir, "cpu_checked")
             return True
-        cprint("    -> Could not resolve download URL for whisper.exe.")
+        cprint_dim("    -> Could not resolve download URL for whisper.exe.")
         return False
 
     tmp_zip = cache_dir / "_dl_whisper.zip"
@@ -1457,7 +1640,8 @@ def ensure_whisper(cache_dir: Path, work_dir: Path, prefer_cuda: bool) -> bool:
         cache_dir,
     )
     if ok:
-        set_cached_whisper_mode(cache_dir, resolved_mode)
+        saved_mode = "cpu_checked" if (prefer_cuda and resolved_mode == "cpu") else resolved_mode
+        set_cached_whisper_mode(cache_dir, saved_mode)
         cprint_step(f"    -> {ok_tag()} whisper.exe ({resolved_mode}) is ready in .cache.")
     return ok
 
@@ -1470,10 +1654,10 @@ def ensure_mplayer(cache_dir: Path, work_dir: Path) -> bool:
         cprint(f"  {ok_tag()} mplayer.exe found in current directory.")
         return True
 
-    cprint_step(f"  {bracket_tag('MISSING', SOFT_YELLOW)} mplayer.exe -> attempting to fetch package into .cache...")
+    cprint_step(f"  {warn_tag('MISSING')} mplayer.exe -> attempting to fetch package into .cache...")
     url = FALLBACK_URLS.get("mplayer_archive", "").strip()
     if not url:
-        cprint("    -> No download URL configured for mplayer.exe.")
+        cprint_dim("    -> No download URL configured for mplayer.exe.")
         return False
 
     tmp_arc = cache_dir / "_dl_mplayer.7z"
@@ -1484,10 +1668,10 @@ def ensure_mplayer(cache_dir: Path, work_dir: Path) -> bool:
         ok = extract_zip_and_copy_exe(tmp_arc, ["mplayer.exe"], "mplayer.exe", cache_dir)
     else:
         ok = try_extract_7z_if_possible(tmp_arc, "mplayer.exe", cache_dir)
-        if not ok and tmp_arc.exists():
+        if not ok:
             tmp_arc.unlink(missing_ok=True)
-            cprint(f"    -> {bracket_tag('INFO', SOFT_CYAN)} mplayer archive is .7z and 7z/7za was not found in PATH.")
-            cprint(f"       Extract mplayer.exe manually into {cache_dir} or set a direct .exe/.zip URL.")
+            cprint(f"    -> {info_tag()} mplayer archive is .7z and 7z/7za was not found in PATH.")
+            cprint_dim(f"       Extract mplayer.exe manually into {cache_dir} or set a direct .exe/.zip URL.")
             return False
 
     if ok:
@@ -1496,13 +1680,13 @@ def ensure_mplayer(cache_dir: Path, work_dir: Path) -> bool:
 
 
 def resolve_model_url(model_arg: str) -> str:
-    """Resolve Hugging Face URL for known Whisper model filenames."""
-    name = Path(model_arg).name.lower()
-    for known_name, url in WHISPER_MODEL_URLS.items():
-        if known_name.lower() == name:
-            return url
+    raw_name = Path(model_arg).name
+    name = raw_name.lower()
+    known = _WHISPER_MODEL_URLS_LOWER.get(name)
+    if known:
+        return known
     if name.startswith("ggml-") and name.endswith(".bin"):
-        return f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{Path(model_arg).name}"
+        return f"{_HF}{raw_name}"
     return ""
 
 
@@ -1516,18 +1700,24 @@ def ensure_model(cache_dir: Path, work_dir: Path, model_arg: str) -> bool:
         target_download_path = cache_dir / model_path
 
     for p in candidate_paths:
-        if p.is_file() and p.stat().st_size > 0:
+        if p.is_file() and _file_nonempty(p):
             cprint(f"  {ok_tag()} Model found: {p}")
             return True
 
     url = resolve_model_url(model_arg)
     if url:
         cprint_step(
-            f"  {bracket_tag('FETCH', SOFT_YELLOW)} Downloading model {Path(model_arg).name} into {target_download_path.parent}..."
+            f"  {info_tag('FETCH')} Downloading model {Path(model_arg).name} into {target_download_path.parent}..."
         )
-        if download_file(url, target_download_path, Path(model_arg).name):
-            cprint_step(f"    -> {ok_tag()} Model is ready: {target_download_path}")
-            return True
+        part_path = target_download_path.with_name(target_download_path.name + ".part")
+        if download_file(url, part_path, Path(model_arg).name):
+            try:
+                os.replace(part_path, target_download_path)
+                cprint_step(f"    -> {ok_tag()} Model is ready: {target_download_path}")
+                return True
+            except OSError as e:
+                cprint(f"  {err_tag()} Could not finalize model file: {e}")
+        part_path.unlink(missing_ok=True)
 
     cprint(f"  {warn_tag('WARNING')} Model '{model_arg}' could not be downloaded automatically.")
     return False
@@ -1535,13 +1725,12 @@ def ensure_model(cache_dir: Path, work_dir: Path, model_arg: str) -> bool:
 
 def ensure_all_dependencies(cache_dir: Path, work_dir: Path, model_arg: str, hw: dict) -> dict[str, bool]:
     cprint_step(f"=== {PROJECT_NAME}: Checking and preparing dependencies (cache: {cache_dir}) ===")
-    status = {
+    return {
         "ffmpeg.exe": ensure_ffmpeg(cache_dir, work_dir),
         "whisper.exe": ensure_whisper(cache_dir, work_dir, prefer_cuda=hw["use_gpu"]),
         "mplayer.exe": ensure_mplayer(cache_dir, work_dir),
         "model": ensure_model(cache_dir, work_dir, model_arg),
     }
-    return status
 
 
 def print_missing_summary(status: dict[str, bool], cache_dir: Path, model_arg: str) -> None:
@@ -1550,7 +1739,7 @@ def print_missing_summary(status: dict[str, bool], cache_dir: Path, model_arg: s
         label = model_arg if key == "model" else key
         state_str = ok_tag() if ok else err_tag("MISSING")
         cprint(f"  {state_str} {label}")
-    cprint(f"Cache directory: {cache_dir}")
+    cprint_dim(f"Cache directory: {cache_dir}")
 
 
 def print_usage_help(status: dict[str, bool], cache_dir: Path, model_arg: str, hw: dict) -> None:
@@ -1559,15 +1748,15 @@ def print_usage_help(status: dict[str, bool], cache_dir: Path, model_arg: str, h
     gpu_desc = f"{gpu['name']} ({gpu['vram_free_mb']} MB free)" if gpu["has_nvidia"] else "none detected"
     mode_desc = "NVIDIA GPU" if hw["use_gpu"] else "CPU"
     cprint(f"\n=== {PROJECT_NAME} Usage ===")
-    cprint(f"  python {script_name} <media_file> [options]")
-    cprint(
+    cprint(f"  {script_name} <media_file> [options]")
+    cprint_dim(
         f"Detected hardware: CPU threads={hw['cpu_threads']} | NVIDIA GPU={gpu_desc} | Compute={mode_desc}"
     )
-    cprint(f"Auto profile: threads={hw['recommended_threads']}")
+    cprint_dim(f"Auto profile: threads={hw['recommended_threads']}")
     cprint("\nExamples:")
-    cprint(f"  python {script_name} movie.mkv")
-    cprint(f"  python {script_name} movie.mkv --lang sk")
-    cprint(f"  python {script_name} movie.mkv --lang sk --force-srt")
+    cprint(f"  {script_name} movie.mkv")
+    cprint(f"  {script_name} movie.mkv --lang sk")
+    cprint(f"  {script_name} movie.mkv --lang sk --force-srt")
     cprint("\nOptions:")
     cprint("  media_file      Path to video or audio file to play")
     cprint(f"  --model         Path or filename of Whisper model (default: {DEFAULT_MODEL} in {CACHE_DIR_NAME}/)")
@@ -1583,7 +1772,7 @@ def print_usage_help(status: dict[str, bool], cache_dir: Path, model_arg: str, h
 # FULL AUDIO EXTRACTION + ENGLISH SRT GENERATION
 # ==============================================================================
 def get_media_duration_sec(ffmpeg_path: Path, media_file: Path) -> float | None:
-    cmd = [str(ffmpeg_path), "-i", str(media_file), "-hide_banner"]
+    cmd = [str(ffmpeg_path), "-hide_banner", "-i", str(media_file)]
     res = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -1593,7 +1782,6 @@ def get_media_duration_sec(ffmpeg_path: Path, media_file: Path) -> float | None:
         errors="replace",
     )
     for line in res.stdout.splitlines():
-        line = line.strip()
         if "Duration:" in line:
             try:
                 part = line.split("Duration:", 1)[1].split(",", 1)[0].strip()
@@ -1614,9 +1802,12 @@ def _run_ffmpeg_audio_extract(
     cmd = [
         str(ffmpeg_path),
         "-y",
+        "-nostdin",
+        "-vn",
+        "-sn",
+        "-dn",
         "-i",
         str(media_file),
-        "-vn",
         "-ac",
         "1",
         "-ar",
@@ -1643,7 +1834,7 @@ def _run_ffmpeg_audio_extract(
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -1653,24 +1844,26 @@ def _run_ffmpeg_audio_extract(
     try:
         if proc.stdout:
             for raw_line in proc.stdout:
-                line = raw_line.strip()
-                if line.startswith("out_time_ms="):
-                    try:
-                        out_us = int(line.split("=", 1)[1].strip())
-                        cur_sec = max(0.0, out_us / 1_000_000.0)
-                        now = time.time()
-                        if now - last_print >= 0.15:
-                            last_print = now
-                            live = format_time_progress_bar(
-                                cur_sec=cur_sec,
-                                total_sec=duration_sec,
-                                elapsed_sec=now - start_wall,
-                                label="Audio extraction",
-                                done=False,
-                            )
-                            write_live_line(live, bar_state, newline=False)
-                    except ValueError:
-                        pass
+                if not raw_line.startswith("out_time_ms="):
+                    continue
+                try:
+                    cur_sec = max(0.0, int(raw_line.split("=", 1)[1].strip()) / 1_000_000.0)
+                except ValueError:
+                    continue
+                now = time.time()
+                if now - last_print >= 0.15:
+                    last_print = now
+                    write_live_line(
+                        format_time_progress_bar(
+                            cur_sec=cur_sec,
+                            total_sec=duration_sec,
+                            elapsed_sec=now - start_wall,
+                            label="Audio extraction",
+                            done=False,
+                        ),
+                        bar_state,
+                        newline=False,
+                    )
         rc = proc.wait()
         if rc != 0 or not temp_wav.is_file() or temp_wav.stat().st_size <= 44:
             finish_live_line_if_needed(bar_state)
@@ -1679,14 +1872,17 @@ def _run_ffmpeg_audio_extract(
 
         elapsed = time.time() - start_wall
         final_sec = duration_sec if (duration_sec and duration_sec > 0) else cur_sec
-        done_line = format_time_progress_bar(
-            cur_sec=final_sec,
-            total_sec=duration_sec,
-            elapsed_sec=elapsed,
-            label="Audio extraction",
-            done=True,
+        write_live_line(
+            format_time_progress_bar(
+                cur_sec=final_sec,
+                total_sec=duration_sec,
+                elapsed_sec=elapsed,
+                label="Audio extraction",
+                done=True,
+            ),
+            bar_state,
+            newline=True,
         )
-        write_live_line(done_line, bar_state, newline=True)
         return True, elapsed
     except Exception:
         finish_live_line_if_needed(bar_state)
@@ -1723,12 +1919,9 @@ def extract_full_audio(
 
 def format_srt_timestamp(seconds: float) -> str:
     ms_total = max(0, int(round(seconds * 1000)))
-    hours = ms_total // 3_600_000
-    rem = ms_total % 3_600_000
-    minutes = rem // 60_000
-    rem = rem % 60_000
-    secs = rem // 1000
-    millis = rem % 1000
+    hours, rem = divmod(ms_total, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, millis = divmod(rem, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
@@ -1739,27 +1932,23 @@ def parse_whisper_ts_to_sec(ts: str) -> float:
 
 
 def _is_non_speech_music_tag(text: str) -> bool:
-    norm = re.sub(r"[^a-zA-Z]+", " ", text).strip().lower()
-    return norm in ("music", "music playing", "blank audio", "applause")
+    return NON_ALPHA_RE.sub(" ", text).strip().lower() in MUSIC_TAGS
 
 
 def _clean_srt_blocks_and_rewrite(srt_path: Path) -> int:
-    """Filter repetitive non-speech `[Music]` hallucination runs and re-index SRT cleanly."""
     if not srt_path.is_file() or srt_path.stat().st_size <= 0:
         return 0
 
     raw = srt_path.read_text(encoding="utf-8", errors="replace")
-    raw_blocks = re.split(r"\r?\n\r?\n", raw.strip())
     cleaned_entries: list[str] = []
     consecutive_music = 0
     idx = 1
 
-    for blk in raw_blocks:
+    for blk in BLOCK_SPLIT_RE.split(raw.strip()):
         lines = [ln.rstrip("\r") for ln in blk.splitlines() if ln.strip()]
         if len(lines) < 3 or "-->" not in lines[1]:
             continue
-        ts_line = lines[1].strip()
-        txt = " ".join(" ".join(lines[2:]).split()).strip()
+        txt = " ".join(" ".join(lines[2:]).split())
         if not txt:
             continue
 
@@ -1770,7 +1959,7 @@ def _clean_srt_blocks_and_rewrite(srt_path: Path) -> int:
         else:
             consecutive_music = 0
 
-        cleaned_entries.append(f"{idx}\n{ts_line}\n{txt}\n")
+        cleaned_entries.append(f"{idx}\n{lines[1].strip()}\n{txt}\n")
         idx += 1
 
     if not cleaned_entries:
@@ -1786,41 +1975,39 @@ def build_srt_from_stdout_lines(lines: list[str], srt_path: Path) -> int:
     segments: list[tuple[float, float, str]] = []
     consecutive_music = 0
     for raw_line in lines:
-        line = raw_line.strip()
-        m = TIMESTAMP_LINE_RE.search(line)
-        if m:
-            s_sec = parse_whisper_ts_to_sec(m.group(1))
-            e_sec = parse_whisper_ts_to_sec(m.group(2))
-            txt = " ".join(m.group(3).split()).strip()
-            if txt and e_sec > s_sec:
-                if _is_non_speech_music_tag(txt):
-                    consecutive_music += 1
-                    if consecutive_music > MAX_CONSECUTIVE_MUSIC_BLOCKS:
-                        continue
-                else:
-                    consecutive_music = 0
-                segments.append((s_sec, e_sec, txt))
+        m = TIMESTAMP_LINE_RE.search(raw_line)
+        if not m:
+            continue
+        s_sec = parse_whisper_ts_to_sec(m.group(1))
+        e_sec = parse_whisper_ts_to_sec(m.group(2))
+        txt = " ".join(m.group(3).split())
+        if txt and e_sec > s_sec:
+            if _is_non_speech_music_tag(txt):
+                consecutive_music += 1
+                if consecutive_music > MAX_CONSECUTIVE_MUSIC_BLOCKS:
+                    continue
+            else:
+                consecutive_music = 0
+            segments.append((s_sec, e_sec, txt))
 
     if not segments:
         return 0
 
     srt_path.parent.mkdir(parents=True, exist_ok=True)
     entries = []
-    idx = 1
     prev_end = 0.0
-    for s_sec, e_sec, txt in segments:
+    for idx, (s_sec, e_sec, txt) in enumerate(segments, start=1):
         start_c = max(s_sec, prev_end)
         end_c = max(start_c + 0.8, e_sec)
         prev_end = end_c
         entries.append(
             f"{idx}\n{format_srt_timestamp(start_c)} --> {format_srt_timestamp(end_c)}\n{txt}\n"
         )
-        idx += 1
 
     with open(srt_path, "w", encoding="utf-8", newline="\r\n") as f:
         f.write("\n".join(entries))
 
-    return idx - 1
+    return len(entries)
 
 
 def _build_whisper_cmds(
@@ -1851,14 +2038,13 @@ def transcribe_full_audio_to_en_srt(
     threads: int,
     hw: dict,
 ) -> bool:
-    """Transcribe/translate full WAV audio into base English `<name>_en.srt` via whisper.exe (-tr)."""
     gpu = hw["gpu"]
     gpu_label = f"{gpu['name']} ({gpu['vram_free_mb']} MB free)" if gpu["has_nvidia"] else "none"
     compute_label = "NVIDIA GPU" if hw["use_gpu"] else "CPU"
 
     cprint_step(f"\n=== Step 2/2: Generating base English SRT -> {en_srt_path} ===")
-    cprint(f"Hardware: CPU={hw['cpu_threads']} threads | GPU={gpu_label} | Active={compute_label}")
-    cprint(f"Whisper threads: {max(1, threads)} | Mode: translate -> English (-tr)")
+    cprint_dim(f"Hardware: CPU={hw['cpu_threads']} threads | GPU={gpu_label} | Active={compute_label}")
+    cprint_dim(f"Whisper threads: {max(1, threads)} | Mode: translate -> English (-tr)")
 
     wav_duration_sec = get_wav_duration_sec(wav_path)
 
@@ -1893,10 +2079,10 @@ def transcribe_full_audio_to_en_srt(
                     s = ln.strip()
                     if s:
                         err_lines.append(s)
+                        if len(err_lines) > 50:
+                            del err_lines[:25]
 
-        def render_transcribe_line(done: bool = False) -> str:
-            with state_lock:
-                cur = latest_media_sec
+        def render_transcribe_line(cur: float, done: bool = False) -> str:
             elapsed = time.time() - start_wall
             effective_cur = wav_duration_sec if (done and wav_duration_sec) else cur
             effective_total = wav_duration_sec if (wav_duration_sec and (cur > 0 or done)) else None
@@ -1909,12 +2095,11 @@ def transcribe_full_audio_to_en_srt(
             )
 
         def ticker_loop():
-            while not stop_ticker.is_set():
+            while not stop_ticker.wait(0.2):
                 with state_lock:
-                    cur = latest_media_sec
-                if cur <= 0:
-                    write_live_line(render_transcribe_line(done=False), bar_state, newline=False)
-                stop_ticker.wait(0.2)
+                    if latest_media_sec > 0:
+                        continue
+                    write_live_line(render_transcribe_line(0.0), bar_state, newline=False)
 
         t_err = threading.Thread(target=read_stderr, daemon=True)
         t_tick = threading.Thread(target=ticker_loop, daemon=True)
@@ -1932,12 +2117,14 @@ def transcribe_full_audio_to_en_srt(
                     if m:
                         try:
                             end_sec = parse_whisper_ts_to_sec(m.group(2))
-                            with state_lock:
-                                if end_sec > latest_media_sec:
-                                    latest_media_sec = end_sec
                         except Exception:
-                            pass
-                        write_live_line(render_transcribe_line(done=False), bar_state, newline=False)
+                            continue
+                        with state_lock:
+                            if end_sec > latest_media_sec:
+                                latest_media_sec = end_sec
+                            write_live_line(
+                                render_transcribe_line(latest_media_sec), bar_state, newline=False
+                            )
 
             rc = proc.wait()
             stop_ticker.set()
@@ -1949,7 +2136,7 @@ def transcribe_full_audio_to_en_srt(
                 temp_srt.unlink(missing_ok=True)
                 if attempt_idx + 1 < len(cmds):
                     cprint_step(
-                        f"  {bracket_tag('INFO', SOFT_YELLOW)} Retrying whisper.exe with standard CLI flags..."
+                        f"  {info_tag()} Retrying whisper.exe with standard CLI flags..."
                     )
                     continue
                 tail = " | ".join(err_lines[-3:]) if err_lines else "unknown error"
@@ -1960,18 +2147,18 @@ def transcribe_full_audio_to_en_srt(
             srt_created = False
             entries_count = 0
 
-            if temp_srt.is_file() and temp_srt.stat().st_size > 0:
+            if _file_nonempty(temp_srt):
                 os.replace(temp_srt, en_srt_path)
                 entries_count = _clean_srt_blocks_and_rewrite(en_srt_path)
                 srt_created = entries_count > 0
             else:
                 count = build_srt_from_stdout_lines(captured_lines, en_srt_path)
-                if count > 0 and en_srt_path.is_file() and en_srt_path.stat().st_size > 0:
+                if count > 0 and _file_nonempty(en_srt_path):
                     entries_count = count
                     srt_created = True
 
             if srt_created:
-                write_live_line(render_transcribe_line(done=True), bar_state, newline=True)
+                write_live_line(render_transcribe_line(0.0, done=True), bar_state, newline=True)
                 elapsed = time.time() - start_wall
                 suffix = f" ({entries_count} entries)" if entries_count > 0 else ""
                 cprint_step(f"  {ok_tag()} EN SRT generated in {elapsed:.1f}s{suffix}: {en_srt_path}")
@@ -2004,16 +2191,14 @@ def ensure_english_srt(
     hw: dict,
     force: bool = False,
 ) -> bool:
-    """Ensure `<name>_en.srt` exists, extracting WAV and running Whisper only if needed."""
-    if en_srt_path.is_file() and en_srt_path.stat().st_size > 0 and not force:
+    if not force and _file_nonempty(en_srt_path):
         cprint(f"\n{ok_tag()} Existing EN SRT found: {en_srt_path}")
         cleanup_wav_file(wav_path, "EN SRT already exists")
         return True
 
-    duration_sec = get_media_duration_sec(ffmpeg_path, media_file)
-    if not wav_path.is_file() or force:
-        ok_audio = extract_full_audio(ffmpeg_path, media_file, wav_path, duration_sec)
-        if not ok_audio:
+    if force or not wav_path.is_file():
+        duration_sec = get_media_duration_sec(ffmpeg_path, media_file)
+        if not extract_full_audio(ffmpeg_path, media_file, wav_path, duration_sec):
             en_srt_path.unlink(missing_ok=True)
             return False
     else:
@@ -2034,11 +2219,104 @@ def ensure_english_srt(
     return True
 
 
-def play_media_with_srt(mplayer_path: Path, media_file: Path, srt_path: Path, sub_scale: float) -> int:
-    """Launch MPlayer with the selected subtitle file."""
+# ==============================================================================
+# AUTOMATIC MPLAYER ENVIRONMENT & RUNTIME DETECTION
+# ==============================================================================
+def find_system_font() -> Path | None:
+    """Detect a usable TrueType font on the system for MPlayer subtitles."""
+    if os.name == "nt":
+        win_dir = Path(os.environ.get("WINDIR", "C:\\Windows"))
+        fonts_dir = win_dir / "Fonts"
+        candidates = [
+            fonts_dir / "arial.ttf",
+            fonts_dir / "segoeui.ttf",
+            fonts_dir / "calibri.ttf",
+            fonts_dir / "tahoma.ttf",
+            fonts_dir / "consola.ttf",
+            fonts_dir / "lucon.ttf",
+        ]
+    else:
+        candidates = [
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+            Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+        ]
+
+    for p in candidates:
+        if p.is_file() and _file_nonempty(p):
+            return p
+    return None
+
+
+def ensure_mplayer_config(cache_dir: Path) -> Path:
+    """Create an isolated MPlayer config directory inside .cache."""
+    mp_cfg_dir = cache_dir / "mplayer"
+    (mp_cfg_dir / "sub").mkdir(parents=True, exist_ok=True)
+    cfg_file = mp_cfg_dir / "config"
+    if not cfg_file.is_file():
+        cfg_file.write_text(
+            "# Auto-generated isolated MPlayer config for subplayer\n"
+            "subcp=utf-8\n"
+            "ffactor=0.75\n",
+            encoding="utf-8",
+        )
+    return cfg_file
+
+
+def _build_mplayer_vo_ao_candidates() -> list[tuple[str | None, str | None]]:
+    """Return ordered (vo, ao) pairs: auto first, then safe fallbacks."""
+    if os.name == "nt":
+        return [
+            (None, None),
+            ("direct3d", "dsound"),
+            ("gl", "dsound"),
+            ("directx", "win32"),
+            ("gl", "win32"),
+            (None, "null"),
+            ("null", "null"),
+        ]
+    return [
+        (None, None),
+        ("gl", "pulse"),
+        ("gl", "alsa"),
+        ("x11", "alsa"),
+        ("null", "null"),
+    ]
+
+
+def _describe_mplayer_exit(rc: int) -> str:
+    if rc == 0:
+        return "exited cleanly (0)"
+    if rc in (-1073741515, 3221225781):
+        return f"missing required DLL dependency (STATUS_DLL_NOT_FOUND / 0xC0000135, code {rc})"
+    if rc in (-1073741819, 3221225477):
+        return f"access violation / crash (STATUS_ACCESS_VIOLATION / 0xC0000005, code {rc})"
+    return f"exited with code {rc}"
+
+
+def play_media_with_srt(
+    mplayer_path: Path,
+    media_file: Path,
+    srt_path: Path,
+    sub_scale: float,
+    cache_dir: Path | None = None,
+) -> int:
     cprint_step(f"\n=== Launching mplayer.exe with subtitles: {srt_path.name} ===")
-    cmd = [
-        str(mplayer_path),
+
+    base_cache = cache_dir or get_cache_dir(get_work_dir())
+    cfg_file = ensure_mplayer_config(base_cache)
+    font_path = find_system_font()
+
+    if font_path:
+        cprint_dim(f"  {info_tag()} Detected subtitle font: {font_path}")
+    else:
+        cprint_dim(f"  {info_tag()} No explicit font path detected; relying on MPlayer default font.")
+
+    common_args = [
+        "-noconfig",
+        "all",
+        "-include",
+        str(cfg_file),
         "-sub",
         str(srt_path),
         "-utf8",
@@ -2046,10 +2324,40 @@ def play_media_with_srt(mplayer_path: Path, media_file: Path, srt_path: Path, su
         "3",
         "-subfont-text-scale",
         f"{sub_scale:.2f}",
-        str(media_file),
     ]
-    res = subprocess.run(cmd)
-    return res.returncode
+    if font_path:
+        common_args.extend(["-font", str(font_path)])
+
+    candidates = _build_mplayer_vo_ao_candidates()
+    last_rc = 1
+
+    for idx, (vo, ao) in enumerate(candidates):
+        cmd = [str(mplayer_path)] + list(common_args)
+        if vo:
+            cmd.extend(["-vo", vo])
+        if ao:
+            cmd.extend(["-ao", ao])
+        cmd.append(str(media_file))
+
+        if idx > 0:
+            cprint_step(
+                f"  {warn_tag()} Retrying mplayer.exe with fallback vo={vo or 'auto'}, ao={ao or 'auto'}..."
+            )
+
+        rc = subprocess.run(cmd).returncode
+        last_rc = rc
+
+        if rc == 0:
+            return 0
+
+        # Missing DLL or access violation usually won't be fixed by changing VO/AO
+        if rc in (-1073741515, 3221225781, -1073741819, 3221225477):
+            cprint(f"  {err_tag()} MPlayer {_describe_mplayer_exit(rc)}.")
+            return rc
+
+    if last_rc != 0:
+        cprint(f"  {err_tag()} MPlayer {_describe_mplayer_exit(last_rc)}.")
+    return last_rc
 
 
 def parse_args(argv: list[str], hw: dict) -> argparse.Namespace:
@@ -2063,6 +2371,19 @@ def parse_args(argv: list[str], hw: dict) -> argparse.Namespace:
     parser.add_argument("--force-srt", action="store_true")
     parser.add_argument("-h", "--help", action="store_true")
     return parser.parse_args(argv)
+
+
+def _find_matching_srt_for_lang(
+    existing_srts: list[Path], subs_dir: Path, media_stem: str, lang_code: str
+) -> Path | None:
+    norm = normalize_lang_code(lang_code)
+    for p in existing_srts:
+        if extract_lang_code_from_srt(p, media_stem) == norm:
+            return p
+    cache_candidate = build_srt_path(subs_dir, media_stem, norm)
+    if _file_nonempty(cache_candidate):
+        return cache_candidate
+    return None
 
 
 def main() -> int:
@@ -2084,13 +2405,7 @@ def main() -> int:
         print_usage_help(status, cache_dir, args.model, hw)
         return 0 if args.help else 1
 
-    required_ok = (
-        status["ffmpeg.exe"]
-        and status["whisper.exe"]
-        and status["mplayer.exe"]
-        and status["model"]
-    )
-    if not required_ok:
+    if not all(status.values()):
         cprint(f"\n{err_tag('STOP')} Cannot start playback: missing required dependencies.")
         print_missing_summary(status, cache_dir, args.model)
         return 1
@@ -2103,6 +2418,8 @@ def main() -> int:
         cprint(f"\n{err_tag()} Media file does not exist: {media_file}")
         print_usage_help(status, cache_dir, args.model, hw)
         return 1
+
+    media_dir = media_file.parent
 
     model_arg_path = Path(args.model)
     if model_arg_path.is_absolute():
@@ -2117,20 +2434,24 @@ def main() -> int:
     mplayer_path = resolve_tool_path(cache_dir, work_dir, "mplayer.exe")
 
     wav_path = audio_dir / f"{media_file.stem}.wav"
-    en_srt_path = build_srt_path(subs_dir, media_file.stem, "en")
+    cached_en_srt_path = build_srt_path(subs_dir, media_file.stem, "en")
 
     selected_srt_path: Path | None = None
     preselected_lang: str | None = None
 
     try:
-        existing_srts = find_existing_srts_for_media(subs_dir, media_file.stem)
+        existing_srts = find_existing_srts_for_media(
+            subs_dir, media_file.stem, media_dir=media_dir
+        )
 
         if not args.force_srt:
             if args.lang is not None:
                 target_lang = normalize_lang_code(args.lang)
-                candidate_srt = build_srt_path(subs_dir, media_file.stem, target_lang)
-                if candidate_srt.is_file() and candidate_srt.stat().st_size > 0:
-                    selected_srt_path = candidate_srt
+                matched = _find_matching_srt_for_lang(
+                    existing_srts, subs_dir, media_file.stem, target_lang
+                )
+                if matched is not None:
+                    selected_srt_path = matched
                     cprint_step(f"\n{ok_tag()} Existing SRT found: {selected_srt_path}")
                     cleanup_wav_file(wav_path, "SRT already exists")
             elif len(existing_srts) == 1:
@@ -2140,7 +2461,7 @@ def main() -> int:
                     cprint_step(f"\n{ok_tag()} Existing SRT found (--no-prompt): {selected_srt_path}")
                 else:
                     wants_translate, direct_lang = prompt_translate_single_existing_srt(
-                        only_srt, media_file.stem, PROMPT_TIMEOUT_SEC
+                        only_srt, media_file.stem, subs_dir=subs_dir, timeout_sec=PROMPT_TIMEOUT_SEC
                     )
                     if not wants_translate:
                         selected_srt_path = only_srt
@@ -2151,18 +2472,27 @@ def main() -> int:
             elif len(existing_srts) > 1:
                 if args.no_prompt:
                     selected_srt_path = next(
-                        (p for p in existing_srts if p.name.lower() == en_srt_path.name.lower()),
+                        (p for p in existing_srts if p.stem.lower() == media_file.stem.lower()),
+                        None,
+                    ) or next(
+                        (p for p in existing_srts if p.name.lower() == cached_en_srt_path.name.lower()),
                         existing_srts[0],
                     )
                     cprint_step(f"\n{ok_tag()} Selected SRT (--no-prompt): {selected_srt_path}")
                 else:
                     selected_srt_path = prompt_select_existing_srt(
-                        existing_srts, media_file.stem, PROMPT_TIMEOUT_SEC
+                        existing_srts, media_file.stem, subs_dir=subs_dir, timeout_sec=PROMPT_TIMEOUT_SEC
                     )
                 if selected_srt_path is not None:
                     cleanup_wav_file(wav_path, "SRT already exists")
 
         if selected_srt_path is None:
+            existing_en_srt = (
+                _find_matching_srt_for_lang(existing_srts, subs_dir, media_file.stem, "en")
+                if not args.force_srt
+                else None
+            )
+
             if preselected_lang is not None:
                 target_lang = normalize_lang_code(preselected_lang)
             elif args.lang is not None:
@@ -2170,26 +2500,30 @@ def main() -> int:
             elif args.no_prompt:
                 target_lang = "en"
             else:
-                default_choice = "sk" if (not args.force_srt and en_srt_path.is_file()) else "en"
+                default_choice = "sk" if existing_en_srt is not None else "en"
                 target_lang = prompt_target_language(default_choice, PROMPT_TIMEOUT_SEC)
 
-            target_srt_path = build_srt_path(subs_dir, media_file.stem, target_lang)
+            cached_target_srt_path = build_srt_path(subs_dir, media_file.stem, target_lang)
 
-            if target_srt_path.is_file() and target_srt_path.stat().st_size > 0 and not args.force_srt:
-                selected_srt_path = target_srt_path
+            matched_target = (
+                _find_matching_srt_for_lang(existing_srts, subs_dir, media_file.stem, target_lang)
+                if not args.force_srt
+                else None
+            )
+            if matched_target is not None:
+                selected_srt_path = matched_target
                 cprint_step(f"\n{ok_tag()} Existing SRT found: {selected_srt_path}")
                 cleanup_wav_file(wav_path, "SRT already exists")
             else:
-                source_en_for_translation = en_srt_path
-                if (
-                    not args.force_srt
-                    and target_lang != "en"
-                    and not (en_srt_path.is_file() and en_srt_path.stat().st_size > 0)
-                    and len(existing_srts) == 1
-                ):
+                source_en_for_translation: Path
+                if existing_en_srt is not None:
+                    source_en_for_translation = existing_en_srt
+                    cprint(f"\n{ok_tag()} Using existing EN SRT: {source_en_for_translation}")
+                    cleanup_wav_file(wav_path, "EN SRT already exists")
+                elif not args.force_srt and target_lang != "en" and existing_srts:
                     source_en_for_translation = existing_srts[0]
                     cprint(
-                        f"\n{bracket_tag('INFO', SOFT_CYAN)} Using existing SRT as translation source: "
+                        f"\n{info_tag()} Using existing SRT as translation source: "
                         f"{source_en_for_translation}"
                     )
                 else:
@@ -2199,7 +2533,7 @@ def main() -> int:
                         model_path=model_path,
                         media_file=media_file,
                         wav_path=wav_path,
-                        en_srt_path=en_srt_path,
+                        en_srt_path=cached_en_srt_path,
                         threads=max(1, args.threads),
                         hw=hw,
                         force=args.force_srt,
@@ -2207,19 +2541,20 @@ def main() -> int:
                     if not ok_en:
                         cprint(f"\n{err_tag()} Failed to generate base English SRT file.")
                         return 1
+                    source_en_for_translation = move_srt_to_media_dir(cached_en_srt_path, media_dir)
 
                 if target_lang == "en":
-                    selected_srt_path = en_srt_path
+                    selected_srt_path = source_en_for_translation
                 else:
                     ok_tr = translate_srt_file_offline(
                         en_srt_path=source_en_for_translation,
-                        out_srt_path=target_srt_path,
+                        out_srt_path=cached_target_srt_path,
                         target_lang=target_lang,
                         models_dir=argos_models_dir,
                         pkg_dir=argos_pkg_dir,
                     )
                     if ok_tr:
-                        selected_srt_path = target_srt_path
+                        selected_srt_path = move_srt_to_media_dir(cached_target_srt_path, media_dir)
                     else:
                         cprint(
                             f"  {warn_tag()} Translation to '{target_lang}' failed -> "
@@ -2227,11 +2562,11 @@ def main() -> int:
                         )
                         selected_srt_path = source_en_for_translation
 
-        return play_media_with_srt(mplayer_path, media_file, selected_srt_path, args.sub_scale)
+        return play_media_with_srt(
+            mplayer_path, media_file, selected_srt_path, args.sub_scale, cache_dir=cache_dir
+        )
     except KeyboardInterrupt:
-        if selected_srt_path is not None and (
-            not selected_srt_path.is_file() or selected_srt_path.stat().st_size == 0
-        ):
+        if selected_srt_path is not None and not _file_nonempty(selected_srt_path):
             selected_srt_path.unlink(missing_ok=True)
         wav_path.unlink(missing_ok=True)
         cprint(f"\n{warn_tag()} Interrupted by user. Incomplete output and temporary audio removed.")
